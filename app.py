@@ -114,8 +114,8 @@ def analyze_step(file_bytes: bytes, material: str, config: dict) -> dict:
         from OCP.TopAbs import TopAbs_FACE
         from OCP.TopExp import TopExp_Explorer
         from OCP.TopoDS import TopoDS
-    except ImportError:
-        return {"available": False, "message": "缺少 STEP 几何引擎。请确认 requirements.txt 中的 cadquery-ocp 已安装完成。"}
+    except ImportError as error:
+        return {"available": False, "message": f"STEP 几何引擎加载失败：{error}。请检查部署日志中的 cadquery-ocp 安装结果。"}
 
     temp_name = ""
     try:
