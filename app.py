@@ -26,6 +26,7 @@ DEFAULT_CONFIG = {
     "surface_treatments": {"无处理": 0.0, "喷砂": 2.0, "氧化": 7.0, "电泳": 10.0,
                            "黑漆": 0.5, "磷化": 4.0, "喷粉": 3.0, "喷漆": 2.0},
     "machine_rates": {"CNC加工中心": 90.0, "车床": 65.0, "龙门铣": 200.0, "卧式加工中心": 175.0},
+    "manual_labor_rate": 35.0,
     "default_stock_allowance_mm": 5.0,
     "casting_blank_factors": {"灰铁": 1.18, "球铁": 1.22, "铸铝": 1.12},
 }
@@ -55,6 +56,9 @@ def load_config() -> dict:
         old_rate = config.pop("cnc_rate", 60.0)
         config["machine_rates"] = {"CNC加工中心": 90.0, "车床": 65.0,
                                    "龙门铣": 200.0, "卧式加工中心": 175.0}
+        changed = True
+    if "manual_labor_rate" not in config:
+        config["manual_labor_rate"] = DEFAULT_CONFIG["manual_labor_rate"]
         changed = True
     if changed:
         save_config(config)
@@ -228,13 +232,16 @@ def analyze_step(file_bytes: bytes, material: str, config: dict, stock_allowance
             finish_hours = 9.0 + (2.0 if tight_tolerance and tight_tolerance <= 0.01 else 0.5)
             side_end_hours = 8.0
             boring_hours = 5.0
-            hole_hours = min(15.0, 2.5 + threads * 0.045 + drilled * 0.025)
+            # 孔在龙门上完成；攻牙不是车床工序，按现场手动攻牙单独计人工。
+            drilling_hours = min(10.0, 2.5 + max(drilled, threads) * 0.03)
+            manual_tapping_hours = min(16.0, max(threads, len((drawing_analysis or {}).get("threads", []))) * 0.045)
             contour_hours = 0.0
             inspection_hours = 4.0 + (1.5 if tight_tolerance and tight_tolerance <= 0.01 else 0.0)
-            total_hours = setup_hours + rough_hours + finish_hours + side_end_hours + boring_hours + hole_hours + inspection_hours
+            total_hours = setup_hours + rough_hours + finish_hours + side_end_hours + boring_hours + drilling_hours + inspection_hours
             time_breakdown = {"上机找正与装夹": setup_hours, "粗铣基准与主要平面": rough_hours,
                               "精铣导轨/安装面": finish_hours, "侧面及端面加工": side_end_hours,
-                              "大孔扩孔与精镗": boring_hours, "钻孔攻牙": hole_hours,
+                              "龙门钻孔、扩孔与精镗": boring_hours + drilling_hours,
+                              "手动攻牙（人工，不计龙门机时）": manual_tapping_hours,
                               "机内测量、去毛刺与检验": inspection_hours}
             first_piece_hours = total_hours + 12.0
             process_template = "大型铸造机架（批量龙门加工）"
@@ -242,12 +249,14 @@ def analyze_step(file_bytes: bytes, material: str, config: dict, stock_allowance
             setup_hours = 0.45 + (0.25 if max_dim > 500 else 0) + (0.35 if max_dim > 1000 else 0)
             rough_hours = removal_cm3 / (2200 if material == "铸铝" else 1300)
             finish_hours = faces * 0.012
-            hole_hours = min(cylinders * 0.055, 2.5 + threads * 0.045 + drilled * 0.025) if drawing_analysis else cylinders * 0.055
+            drilling_hours = min(cylinders * 0.055, 1.0 + max(drilled, threads) * 0.025) if drawing_analysis else cylinders * 0.055
+            manual_tapping_hours = min(12.0, max(threads, len((drawing_analysis or {}).get("threads", []))) * 0.04)
             contour_hours = spline_faces * 0.12
             inspection_hours = 0.10 + (0.15 if difficulty_score >= 30 else 0)
-            total_hours = max(0.25, setup_hours + rough_hours + finish_hours + hole_hours + contour_hours + inspection_hours)
+            total_hours = max(0.25, setup_hours + rough_hours + finish_hours + drilling_hours + contour_hours + inspection_hours)
             time_breakdown = {"装夹与编程": setup_hours, "粗加工（去除材料）": rough_hours,
-                              "精加工（平面/轮廓）": finish_hours, "孔/圆柱特征": hole_hours,
+                              "精加工（平面/轮廓）": finish_hours, "设备钻孔/扩孔/镗孔": drilling_hours,
+                              "手动攻牙（人工）": manual_tapping_hours,
                               "自由曲面": contour_hours, "检验与去毛刺": inspection_hours}
             first_piece_hours = total_hours + (4.0 if max_dim > 500 else 1.5)
             process_template = "通用铸件加工"
@@ -263,7 +272,8 @@ def analyze_step(file_bytes: bytes, material: str, config: dict, stock_allowance
                 "volume_mm3": volume_mm3, "actual_weight": weight_kg, "blank_weight": blank_weight_kg,
                 "faces": faces, "cylinders": cylinders, "spline_faces": spline_faces, "removal_cm3": removal_cm3,
                 "difficulty": difficulty, "recommended_machine_hours": recommended, "source": "STEP 实体体积",
-                "time_breakdown": time_breakdown, "batch_hours": round(total_hours, 1),
+                "primary_machine": primary, "finish_hours": round(finish_hours, 2),
+                "time_breakdown": time_breakdown, "manual_labor_hours": round(manual_tapping_hours, 1), "batch_hours": round(total_hours, 1),
                 "first_piece_hours": round(first_piece_hours, 1), "process_template": process_template}
     except Exception as error:
         return {"available": False, "message": f"STEP 几何分析失败：{error}"}
@@ -273,20 +283,21 @@ def analyze_step(file_bytes: bytes, material: str, config: dict, stock_allowance
 
 
 def calculate(config: dict, material: str, weight: float, machine_hours: dict[str, float],
-              treatment: str, packaging_cost: float) -> dict:
+              manual_labor_hours: float, treatment: str, packaging_cost: float) -> dict:
     material_cost = weight * config["materials"][material]
     machine_costs = {name: hours * config["machine_rates"][name] for name, hours in machine_hours.items()}
     cnc_cost = sum(machine_costs.values())
+    manual_labor_cost = manual_labor_hours * float(config.get("manual_labor_rate", 35.0))
     surface_cost = weight * config["surface_treatments"][treatment]
-    total_cost = material_cost + cnc_cost + surface_cost + packaging_cost
+    total_cost = material_cost + cnc_cost + manual_labor_cost + surface_cost + packaging_cost
     return {"material_cost": material_cost, "machine_costs": machine_costs, "cnc_cost": cnc_cost,
-            "surface_cost": surface_cost, "total_cost": total_cost,
+            "manual_labor_cost": manual_labor_cost, "surface_cost": surface_cost, "total_cost": total_cost,
             "final_price": total_cost * config["profit_multiplier"]}
 
 
 def pricing_advice(data: dict, costs: dict, config: dict, step_result: dict | None) -> list[str]:
     messages = []
-    total_hours = sum(data["machine_hours"].values())
+    total_hours = sum(data["machine_hours"].values()) + data.get("manual_labor_hours", 0.0)
     if total_hours == 0:
         messages.append("未录入加工工时：请工程人员确认是否存在钻孔、攻牙、精加工等机加工工序。")
     if data["quantity"] >= 50 and total_hours > 0:
@@ -301,11 +312,11 @@ def pricing_advice(data: dict, costs: dict, config: dict, step_result: dict | No
 
 
 def save_quote(data: dict, costs: dict, config: dict) -> None:
-    total_hours = sum(data["machine_hours"].values())
+    total_hours = sum(data["machine_hours"].values()) + data.get("manual_labor_hours", 0.0)
     values = (datetime.now().strftime("%Y-%m-%d %H:%M"), data["customer"], data["product_name"], data["product_number"],
               data["quantity"], data["material"], data["weight"], total_hours, data["treatment"], data["packaging_cost"],
               costs["material_cost"], costs["cnc_cost"], costs["surface_cost"], costs["total_cost"], config["profit_multiplier"],
-              costs["final_price"], json.dumps(data["machine_hours"], ensure_ascii=False))
+              costs["final_price"], json.dumps({"设备机时": data["machine_hours"], "人工工时": data.get("manual_labor_hours", 0.0)}, ensure_ascii=False))
     with sqlite3.connect(DB_FILE) as conn:
         conn.execute("""INSERT INTO quotes (quote_date, customer, product_name, product_number, quantity, material, weight,
           cnc_hours, surface_treatment, packaging_cost, material_cost, cnc_cost, surface_cost, total_cost, profit_multiplier,
@@ -319,7 +330,8 @@ def quote_excel(data: dict, costs: dict, config: dict) -> bytes:
                  ["表面处理", data["treatment"]]]
     cnc_rows = [[f"{name}（{data['machine_hours'][name]:.2f} 小时）", costs["machine_costs"][name]]
                 for name in data["machine_hours"] if data["machine_hours"][name] > 0]
-    detail_rows = [["材料成本", costs["material_cost"]], *cnc_rows, ["CNC加工成本合计", costs["cnc_cost"]],
+    manual_row = [f"手动攻牙/辅助人工（{data.get('manual_labor_hours', 0.0):.2f} 小时 × ¥{config.get('manual_labor_rate', 35.0):.0f}）", costs["manual_labor_cost"]]
+    detail_rows = [["材料成本", costs["material_cost"]], *cnc_rows, ["设备加工成本合计", costs["cnc_cost"]], manual_row,
                    ["表面处理成本", costs["surface_cost"]], ["包装成本", data["packaging_cost"]], ["总成本", costs["total_cost"]],
                    ["利润系数", config["profit_multiplier"]], ["最终报价", costs["final_price"]]]
     output = BytesIO()
@@ -362,6 +374,7 @@ def pricing_page(config: dict) -> None:
                 st.session_state["weight_input"] = round(step_result["actual_weight"], 3)
                 for machine, hours in step_result["recommended_machine_hours"].items():
                     st.session_state[f"hours_{machine}"] = hours
+                st.session_state["manual_labor_hours_input"] = step_result.get("manual_labor_hours", 0.0)
                 st.success("模型实体分析完成：真实体积重量与建议工时已带入下方表单。")
             else: st.warning(step_result["message"])
     step_result = st.session_state.get("step_result", step_result)
@@ -385,7 +398,20 @@ def pricing_page(config: dict) -> None:
         st.write(f"自动工时构成 - {step_result['process_template']}（小时，仅作工艺员复核起点）：")
         st.dataframe(pd.DataFrame(list(step_result["time_breakdown"].items()), columns=["工序", "建议工时（小时）"]),
                      hide_index=True, use_container_width=True)
-        st.info(f"建议批量占机：{step_result['batch_hours']:.1f} 小时；首件含编程/工艺准备：{step_result['first_piece_hours']:.1f} 小时。")
+        st.info(f"建议批量设备占机：{step_result['batch_hours']:.1f} 小时；手动攻牙/辅助人工：{step_result.get('manual_labor_hours', 0.0):.1f} 小时；首件含编程/工艺准备：{step_result['first_piece_hours']:.1f} 小时（设备机时）。")
+        finish_options = [name for name in ["龙门铣", "卧式加工中心"] if name in config["machine_rates"]]
+        if finish_options:
+            default_finish_machine = step_result.get("primary_machine", finish_options[0])
+            finish_machine = st.selectbox("精加工设备分配（可按实际设备调整）", finish_options,
+                                          index=finish_options.index(default_finish_machine) if default_finish_machine in finish_options else 0,
+                                          key="finish_machine_assignment")
+            if st.button("将精加工工时分配到所选设备"):
+                source_machine = step_result.get("primary_machine", "龙门铣")
+                finish_hours = step_result.get("finish_hours", 0.0)
+                if source_machine in config["machine_rates"]:
+                    st.session_state[f"hours_{source_machine}"] = round(max(0.0, st.session_state.get(f"hours_{source_machine}", 0.0) - finish_hours), 2)
+                st.session_state[f"hours_{finish_machine}"] = round(st.session_state.get(f"hours_{finish_machine}", 0.0) + finish_hours, 2)
+                st.success(f"已将 {finish_hours:.1f} 小时精加工分配至{finish_machine}；其余钻孔/扩孔/精镗仍保留在原设备机时。")
 
     with st.form("quote_form"):
         left, right = st.columns(2)
@@ -399,11 +425,14 @@ def pricing_page(config: dict) -> None:
             weight = st.number_input("产品重量（kg）", min_value=0.0, value=float(st.session_state.get("weight_input", 0.0)), step=0.1, key="weight_input")
             treatment = st.selectbox("表面处理", list(config["surface_treatments"]), key="treatment_input")
             packaging_cost = st.number_input("包装费用（元）", min_value=0.0, value=0.0, step=1.0, key="packaging_input")
-        st.subheader("CNC 加工工时（小时）")
+        st.subheader("设备加工工时（小时）")
         machine_cols = st.columns(len(config["machine_rates"]))
         machine_hours = {}
         for col, name in zip(machine_cols, config["machine_rates"]):
             machine_hours[name] = col.number_input(f"{name}\n¥{config['machine_rates'][name]:.0f}/小时", min_value=0.0, value=0.0, step=0.1, key=f"hours_{name}")
+        st.caption("钻孔、扩孔、铰孔、镗孔计入设备机时；大型件默认由龙门完成。精加工可按实际情况在龙门铣或卧式加工中心之间手动分配。")
+        manual_labor_hours = st.number_input(f"手动攻牙/辅助人工（小时，¥{config.get('manual_labor_rate', 35.0):.0f}/小时）", min_value=0.0,
+                                             value=0.0, step=0.1, key="manual_labor_hours_input")
         submitted = st.form_submit_button("计算报价", type="primary")
     if submitted:
         if not customer.strip() or not product_name.strip():
@@ -411,13 +440,14 @@ def pricing_page(config: dict) -> None:
             return
         data = {"customer": customer.strip(), "product_name": product_name.strip(), "product_number": product_number.strip(),
                 "quantity": int(quantity), "material": material, "weight": weight, "machine_hours": machine_hours,
+                "manual_labor_hours": manual_labor_hours,
                 "treatment": treatment, "packaging_cost": packaging_cost}
-        st.session_state["quote"] = (data, calculate(config, material, weight, machine_hours, treatment, packaging_cost))
+        st.session_state["quote"] = (data, calculate(config, material, weight, machine_hours, manual_labor_hours, treatment, packaging_cost))
     if "quote" in st.session_state:
         data, costs = st.session_state["quote"]
         st.subheader("报价结果")
         metrics = [("材料成本", costs["material_cost"]), *[(f"{n}成本", v) for n, v in costs["machine_costs"].items() if v],
-                   ("CNC加工合计", costs["cnc_cost"]), ("表面处理成本", costs["surface_cost"]),
+                   ("设备加工合计", costs["cnc_cost"]), ("手动攻牙/人工", costs["manual_labor_cost"]), ("表面处理成本", costs["surface_cost"]),
                    ("包装成本", data["packaging_cost"]), ("总成本", costs["total_cost"]), ("最终报价", costs["final_price"])]
         for start in range(0, len(metrics), 3):
             for col, (label, value) in zip(st.columns(3), metrics[start:start + 3]): col.metric(label, f"¥ {value:,.2f}")
@@ -455,11 +485,14 @@ def settings_page(config: dict) -> None:
         blank_factors = {n: st.number_input(n, min_value=1.0, value=float(v), step=0.01, key=f"b_{n}") for n, v in config["casting_blank_factors"].items()}
         st.subheader("设备工时单价（元/小时）")
         rates = {n: st.number_input(n, min_value=0.0, value=float(v), step=5.0, key=f"r_{n}") for n, v in config["machine_rates"].items()}
+        manual_labor_rate = st.number_input("手动攻牙/辅助人工单价（元/小时）", min_value=0.0,
+                                            value=float(config.get("manual_labor_rate", 35.0)), step=5.0)
         st.subheader("表面处理单价（元/kg）")
         treatments = {n: st.number_input(n, min_value=0.0, value=float(v), step=0.5, key=f"s_{n}") for n, v in config["surface_treatments"].items()}
         if st.form_submit_button("保存参数", type="primary"):
             save_config({"company_name": company_name, "profit_multiplier": profit, "materials": materials,
                          "densities": densities, "machine_rates": rates, "surface_treatments": treatments,
+                         "manual_labor_rate": manual_labor_rate,
                          "default_stock_allowance_mm": config.get("default_stock_allowance_mm", 5.0),
                          "casting_blank_factors": blank_factors})
             st.success("参数已保存。")
