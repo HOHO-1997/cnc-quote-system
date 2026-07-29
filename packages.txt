@@ -2,3 +2,6 @@ libgl1
 libxrender1
 libxext6
 libsm6
+tesseract-ocr
+tesseract-ocr-chi-sim
+poppler-utils
