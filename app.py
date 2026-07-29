@@ -7,7 +7,7 @@ import re
 import sqlite3
 import tempfile
 from datetime import datetime
-from io import BytesIO
+from io import BytesIO, StringIO
 from pathlib import Path
 
 import pandas as pd
@@ -25,7 +25,7 @@ DEFAULT_CONFIG = {
     "densities": {"灰铁": 7.2, "球铁": 7.29, "铸铝": 2.7},  # g/cm³
     "surface_treatments": {"无处理": 0.0, "喷砂": 2.0, "氧化": 7.0, "电泳": 10.0,
                            "黑漆": 0.5, "磷化": 4.0, "喷粉": 3.0, "喷漆": 2.0},
-    "machine_rates": {"CNC加工中心": 90.0, "车床": 65.0, "龙门铣": 200.0, "卧式加工中心": 175.0},
+    "machine_rates": {"CNC加工中心": 90.0, "车床": 65.0, "龙门铣": 200.0, "卧式加工中心": 175.0, "磨床": 90.0},
     "manual_labor_rate": 35.0,
     "default_stock_allowance_mm": 5.0,
     "casting_blank_factors": {"灰铁": 1.18, "球铁": 1.22, "铸铝": 1.12},
@@ -57,6 +57,10 @@ def load_config() -> dict:
         config["machine_rates"] = {"CNC加工中心": 90.0, "车床": 65.0,
                                    "龙门铣": 200.0, "卧式加工中心": 175.0}
         changed = True
+    if "磨床" not in config["machine_rates"]:
+        # 配磨按 CNC 加工中心单价核算，后续可在参数页单独维护。
+        config["machine_rates"]["磨床"] = config["machine_rates"].get("CNC加工中心", 90.0)
+        changed = True
     if "manual_labor_rate" not in config:
         config["manual_labor_rate"] = DEFAULT_CONFIG["manual_labor_rate"]
         changed = True
@@ -81,7 +85,14 @@ def init_database() -> None:
                 conn.execute(f"ALTER TABLE quotes ADD COLUMN {name} {kind}")
 
 
-def extract_pdf_info(file_bytes: bytes) -> tuple[dict, str]:
+def product_name_from_filename(file_name: str) -> str:
+    """图纸标题栏未能复制时，以文件名中的中文名称作为可靠回退。"""
+    stem = Path(file_name).stem.strip()
+    chinese_name = "".join(re.findall(r"[\u4e00-\u9fff]+", stem))
+    return chinese_name or stem
+
+
+def extract_pdf_info(file_bytes: bytes, file_name: str = "") -> tuple[dict, str]:
     """从可复制文字的 PDF 图纸提取常见字段；扫描件需后续 OCR 支持。"""
     reader = PdfReader(BytesIO(file_bytes))
     text = "\n".join(page.extract_text() or "" for page in reader.pages)
@@ -97,6 +108,8 @@ def extract_pdf_info(file_bytes: bytes) -> tuple[dict, str]:
         match = re.search(pattern, text, flags=re.IGNORECASE)
         if match:
             result[key] = float(match.group(1)) if key == "weight" else (int(match.group(1)) if key == "quantity" else match.group(1))
+    if not result.get("product_name") and file_name:
+        result["product_name"] = product_name_from_filename(file_name)
     if "customer" not in result:
         company = re.search(r"([\u4e00-\u9fff]{2,30}(?:有限责任公司|股份有限公司|有限公司))", text)
         if company: result["customer"] = company.group(1)
@@ -120,6 +133,33 @@ def extract_pdf_info(file_bytes: bytes) -> tuple[dict, str]:
     return result, text
 
 
+def extract_dxf_info(file_bytes: bytes, file_name: str = "") -> tuple[dict, str]:
+    """读取 DXF 的文字实体；DWG 请先由 CAD 另存为 DXF 后上传。"""
+    try:
+        import ezdxf
+        # 国内 CAD 导出的 DXF 常见为 GBK；ASCII 结构在 UTF-8 DXF 中同样可读。
+        document = ezdxf.read(StringIO(file_bytes.decode("gbk", errors="replace")))
+    except Exception as error:
+        raise ValueError(f"DXF 读取失败：{error}") from error
+    texts: list[str] = []
+    for layout in document.layouts:
+        for entity in layout:
+            entity_type = entity.dxftype()
+            if entity_type in {"TEXT", "ATTRIB"}:
+                texts.append(entity.dxf.text)
+            elif entity_type == "MTEXT":
+                texts.append(entity.plain_text())
+    text = "\n".join(texts)
+    result: dict[str, object] = {"product_name": product_name_from_filename(file_name)} if file_name else {}
+    normalized = text.replace(" ", "").upper()
+    if re.search(r"球铁|QT\d+|FCD\d+|DUCTILE", normalized): result["material"] = "球铁"
+    elif re.search(r"铸铝|ZL\d+|ADC\d+|A356|ALSI", normalized): result["material"] = "铸铝"
+    elif re.search(r"灰铁|HT\d+|FC\d+|GRAYIRON", normalized): result["material"] = "灰铁"
+    number = re.search(r"(?:图号|零件号|产品编号)[：:\s#-]*([A-Za-z0-9_.-]{3,})", text, flags=re.IGNORECASE)
+    if number: result["product_number"] = number.group(1)
+    return result, text
+
+
 def analyze_drawing_text(text: str) -> dict:
     """从 2D 图纸文字提取精度/工艺信号，作为工时复核依据。"""
     normalized = re.sub(r"\s+", "", text)
@@ -136,6 +176,7 @@ def analyze_drawing_text(text: str) -> dict:
     threaded_count = sum(int(count) for count in thread_groups)
     drilled_count = sum(int(count) for count, _ in hole_matches)
     min_tolerance = min(tolerance_values) if tolerance_values else None
+    requires_grinding = any(term in normalized for term in ["磨削", "配磨", "配对磨", "等高", "磨床"])
     suggestions, extra_hours = [], 0.0
     if min_tolerance is not None and min_tolerance <= 0.05:
         suggestions.append(f"检测到最严尺寸公差约 ±{min_tolerance:.3f} mm：建议增加精加工和专用量检具检验。")
@@ -158,12 +199,12 @@ def analyze_drawing_text(text: str) -> dict:
         extra_hours += 0.03 * hole_total
     return {"min_tolerance": min_tolerance, "gd_terms": gd_terms, "roughness": roughness,
             "threads": threads, "hole_matches": hole_matches, "threaded_count": threaded_count,
-            "drilled_count": drilled_count, "suggestions": suggestions,
+            "drilled_count": drilled_count, "requires_grinding": requires_grinding, "suggestions": suggestions,
             "extra_hours": round(extra_hours, 2)}
 
 
 def analyze_step(file_bytes: bytes, material: str, config: dict, stock_allowance_mm: float,
-                 drawing_analysis: dict | None = None) -> dict:
+                 drawing_analysis: dict | None = None, manual_tapping: bool = False) -> dict:
     """使用 OpenCascade 读取 STEP 实体，取得真实体积、尺寸及基础加工特征。"""
     try:
         from OCP.BRepAdaptor import BRepAdaptor_Surface
@@ -224,6 +265,7 @@ def analyze_step(file_bytes: bytes, material: str, config: dict, stock_allowance
         threads = (drawing_analysis or {}).get("threaded_count", 0)
         drilled = (drawing_analysis or {}).get("drilled_count", 0)
         tight_tolerance = (drawing_analysis or {}).get("min_tolerance")
+        requires_grinding = (drawing_analysis or {}).get("requires_grinding", False)
         is_large_frame = max_dim >= 1500 and (threads + drilled >= 80 or faces >= 500)
         if is_large_frame:
             # 按大型铸造机架批量加工工艺模板估算，避免把每个圆柱面都误当作独立孔。
@@ -234,47 +276,53 @@ def analyze_step(file_bytes: bytes, material: str, config: dict, stock_allowance
             boring_hours = 5.0
             # 孔在龙门上完成；攻牙不是车床工序，按现场手动攻牙单独计人工。
             drilling_hours = min(10.0, 2.5 + max(drilled, threads) * 0.03)
-            manual_tapping_hours = min(16.0, max(threads, len((drawing_analysis or {}).get("threads", []))) * 0.045)
+            tapping_hours = min(16.0, max(threads, len((drawing_analysis or {}).get("threads", []))) * 0.045)
+            manual_tapping_hours = tapping_hours if manual_tapping else 0.0
             contour_hours = 0.0
             inspection_hours = 4.0 + (1.5 if tight_tolerance and tight_tolerance <= 0.01 else 0.0)
-            total_hours = setup_hours + rough_hours + finish_hours + side_end_hours + boring_hours + drilling_hours + inspection_hours
+            total_hours = setup_hours + rough_hours + finish_hours + side_end_hours + boring_hours + drilling_hours + inspection_hours + (0.0 if manual_tapping else tapping_hours)
             time_breakdown = {"上机找正与装夹": setup_hours, "粗铣基准与主要平面": rough_hours,
                               "精铣导轨/安装面": finish_hours, "侧面及端面加工": side_end_hours,
                               "龙门钻孔、扩孔与精镗": boring_hours + drilling_hours,
-                              "手动攻牙（人工，不计龙门机时）": manual_tapping_hours,
+                              ("手动攻牙（人工，不计龙门机时）" if manual_tapping else "设备刚性攻牙（计设备机时）"): tapping_hours,
                               "机内测量、去毛刺与检验": inspection_hours}
             first_piece_hours = total_hours + 12.0
             process_template = "大型铸造机架（批量龙门加工）"
         else:
             setup_hours = 0.45 + (0.25 if max_dim > 500 else 0) + (0.35 if max_dim > 1000 else 0)
-            rough_hours = removal_cm3 / (2200 if material == "铸铝" else 1300)
-            finish_hours = faces * 0.012
-            drilling_hours = min(cylinders * 0.055, 1.0 + max(drilled, threads) * 0.025) if drawing_analysis else cylinders * 0.055
-            manual_tapping_hours = min(12.0, max(threads, len((drawing_analysis or {}).get("threads", []))) * 0.04)
-            contour_hours = spline_faces * 0.12
-            inspection_hours = 0.10 + (0.15 if difficulty_score >= 30 else 0)
-            total_hours = max(0.25, setup_hours + rough_hours + finish_hours + drilling_hours + contour_hours + inspection_hours)
+            # 中小型铸造支架批量加工不应按全部 STEP 面数线性累加；面数中包含大量铸造圆角。
+            is_medium_bracket = 250 <= max_dim <= 800 and material in {"灰铁", "球铁"}
+            setup_hours = 0.55 if is_medium_bracket else setup_hours
+            rough_hours = min(1.1, removal_cm3 / 3500) if is_medium_bracket else removal_cm3 / (2200 if material == "铸铝" else 1300)
+            finish_hours = min(0.75, max(0.45, faces * 0.0013)) if is_medium_bracket else faces * 0.012
+            drilling_hours = min(1.05, 0.22 + max(drilled, threads) * 0.014) if is_medium_bracket else (min(cylinders * 0.055, 1.0 + max(drilled, threads) * 0.025) if drawing_analysis else cylinders * 0.055)
+            tapping_hours = min(1.1, max(threads, len((drawing_analysis or {}).get("threads", []))) * 0.016) if is_medium_bracket else min(3.0, max(threads, len((drawing_analysis or {}).get("threads", []))) * 0.04)
+            manual_tapping_hours = tapping_hours if manual_tapping else 0.0
+            contour_hours = min(0.20, spline_faces * 0.03) if is_medium_bracket else spline_faces * 0.12
+            inspection_hours = 0.15 if is_medium_bracket else 0.10 + (0.15 if difficulty_score >= 30 else 0)
+            total_hours = max(0.25, setup_hours + rough_hours + finish_hours + drilling_hours + contour_hours + inspection_hours + (0.0 if manual_tapping else tapping_hours))
             time_breakdown = {"装夹与编程": setup_hours, "粗加工（去除材料）": rough_hours,
                               "精加工（平面/轮廓）": finish_hours, "设备钻孔/扩孔/镗孔": drilling_hours,
-                              "手动攻牙（人工）": manual_tapping_hours,
+                              ("手动攻牙（人工）" if manual_tapping else "设备刚性攻牙"): tapping_hours,
                               "自由曲面": contour_hours, "检验与去毛刺": inspection_hours}
             first_piece_hours = total_hours + (4.0 if max_dim > 500 else 1.5)
             process_template = "通用铸件加工"
         difficulty = "高" if difficulty_score >= 80 else ("中" if difficulty_score >= 30 else "低")
         recommended = {name: 0.0 for name in config["machine_rates"]}
-        primary = "龙门铣" if max_dim > 1000 else ("卧式加工中心" if max_dim > 500 or weight_kg > 50 else "CNC加工中心")
+        primary = "龙门铣" if max_dim > 1000 else ("卧式加工中心" if max_dim > 800 or weight_kg > 500 else "CNC加工中心")
         recommended[primary] = round(total_hours, 2)
-        if not is_large_frame and cylinders >= 4 and "车床" in recommended:
-            lathe_hours = round(min(total_hours * 0.45, 0.3 + cylinders * 0.035), 2)
-            recommended["车床"] = lathe_hours
-            recommended[primary] = round(max(0.15, total_hours - lathe_hours), 2)
+        grinding_hours = 0.0
+        if (requires_grinding or (is_medium_bracket and tight_tolerance and tight_tolerance <= 0.01)) and "磨床" in recommended:
+            grinding_hours = 0.7 if is_medium_bracket else 1.0
+            recommended["磨床"] = grinding_hours
+            time_breakdown["配对磨/磨削（磨床）"] = grinding_hours
         return {"available": True, "dimensions": dimensions, "blank_dimensions": blank_dimensions, "stock_allowance_mm": stock_allowance_mm,
                 "volume_mm3": volume_mm3, "actual_weight": weight_kg, "blank_weight": blank_weight_kg,
                 "faces": faces, "cylinders": cylinders, "spline_faces": spline_faces, "removal_cm3": removal_cm3,
                 "difficulty": difficulty, "recommended_machine_hours": recommended, "source": "STEP 实体体积",
                 "primary_machine": primary, "finish_hours": round(finish_hours, 2),
-                "time_breakdown": time_breakdown, "manual_labor_hours": round(manual_tapping_hours, 1), "batch_hours": round(total_hours, 1),
-                "first_piece_hours": round(first_piece_hours, 1), "process_template": process_template}
+                "time_breakdown": time_breakdown, "manual_labor_hours": round(manual_tapping_hours, 1), "batch_hours": round(total_hours + grinding_hours, 1),
+                "first_piece_hours": round(first_piece_hours + grinding_hours, 1), "process_template": process_template}
     except Exception as error:
         return {"available": False, "message": f"STEP 几何分析失败：{error}"}
     finally:
@@ -283,12 +331,13 @@ def analyze_step(file_bytes: bytes, material: str, config: dict, stock_allowance
 
 
 def calculate(config: dict, material: str, weight: float, machine_hours: dict[str, float],
-              manual_labor_hours: float, treatment: str, packaging_cost: float) -> dict:
-    material_cost = weight * config["materials"][material]
+              manual_labor_hours: float, casting_weight: float, treatment: str, packaging_cost: float,
+              surface_cost_override: float = 0.0) -> dict:
+    material_cost = casting_weight * config["materials"][material]
     machine_costs = {name: hours * config["machine_rates"][name] for name, hours in machine_hours.items()}
     cnc_cost = sum(machine_costs.values())
     manual_labor_cost = manual_labor_hours * float(config.get("manual_labor_rate", 35.0))
-    surface_cost = weight * config["surface_treatments"][treatment]
+    surface_cost = surface_cost_override if surface_cost_override > 0 else weight * config["surface_treatments"][treatment]
     total_cost = material_cost + cnc_cost + manual_labor_cost + surface_cost + packaging_cost
     return {"material_cost": material_cost, "machine_costs": machine_costs, "cnc_cost": cnc_cost,
             "manual_labor_cost": manual_labor_cost, "surface_cost": surface_cost, "total_cost": total_cost,
@@ -326,7 +375,7 @@ def save_quote(data: dict, costs: dict, config: dict) -> None:
 def quote_excel(data: dict, costs: dict, config: dict) -> bytes:
     info_rows = [["公司名称", config["company_name"]], ["报价日期", datetime.now().strftime("%Y-%m-%d")],
                  ["客户名称", data["customer"]], ["产品名称", data["product_name"]], ["产品编号", data["product_number"]],
-                 ["数量", data["quantity"]], ["材料", data["material"]], ["产品重量 (kg)", data["weight"]],
+                 ["数量", data["quantity"]], ["材料", data["material"]], ["产品净重 (kg)", data["weight"]], ["铸件计价重量 (kg)", data.get("casting_weight", data["weight"])],
                  ["表面处理", data["treatment"]]]
     cnc_rows = [[f"{name}（{data['machine_hours'][name]:.2f} 小时）", costs["machine_costs"][name]]
                 for name in data["machine_hours"] if data["machine_hours"][name] > 0]
@@ -348,14 +397,17 @@ def pricing_page(config: dict) -> None:
     st.header("新建报价")
     pdf_result, step_result = None, None
     with st.expander("图纸与模型辅助（可选）"):
-        pdf_file = st.file_uploader("上传 PDF 图纸（提取可复制文字中的图号、材料、重量、数量）", type=["pdf"])
+        pdf_file = st.file_uploader("上传 PDF 图纸（提取图号、产品名称、材料、重量、数量）", type=["pdf"])
+        dxf_file = st.file_uploader("上传 CAD DXF 图纸（提取文字、图号、产品名称、材料）", type=["dxf"])
+        st.caption("目前支持 PDF 与 DXF。DWG 请先在 AutoCAD 中“另存为 DXF”后上传；网页端不能可靠直接读取原始 DWG。")
         step_file = st.file_uploader("上传 STEP/3D 模型（.step / .stp，估算重量与加工难度）", type=["step", "stp"])
         selected_material = st.session_state.get("material_input", list(config["materials"])[0])
+        tapping_mode = st.radio("攻牙方式", ["设备刚性攻牙（计设备机时）", "手动攻牙（计人工 ¥35/小时）"], horizontal=True)
         stock_allowance = st.number_input("毛坯加工余量（每侧，mm）", min_value=0.0,
                                           value=float(config.get("default_stock_allowance_mm", 5.0)), step=0.5)
         if pdf_file and st.button("读取 PDF 图纸"):
             try:
-                pdf_result, raw_text = extract_pdf_info(pdf_file.getvalue())
+                pdf_result, raw_text = extract_pdf_info(pdf_file.getvalue(), pdf_file.name)
                 st.session_state["drawing_analysis"] = analyze_drawing_text(raw_text)
                 for key, value in pdf_result.items():
                     widget_key = {"product_number": "product_number_input", "product_name": "product_name_input",
@@ -366,12 +418,25 @@ def pricing_page(config: dict) -> None:
                 if not raw_text.strip(): st.warning("该 PDF 未包含可复制文字，扫描图纸需要后续接入 OCR。")
             except Exception as error:
                 st.error(f"PDF 读取失败：{error}")
+        if dxf_file and st.button("读取 DXF 图纸"):
+            try:
+                dxf_result, raw_text = extract_dxf_info(dxf_file.getvalue(), dxf_file.name)
+                st.session_state["drawing_analysis"] = analyze_drawing_text(raw_text)
+                for key, value in dxf_result.items():
+                    widget_key = {"product_number": "product_number_input", "product_name": "product_name_input",
+                                  "customer": "customer_input", "weight": "weight_input", "quantity": "quantity_input",
+                                  "material": "material_input"}.get(key)
+                    if widget_key: st.session_state[widget_key] = value
+                st.success("DXF 图纸读取完成，已识别的信息会带入下方表单。")
+            except Exception as error:
+                st.error(f"DXF 读取失败：{error}")
         if step_file and st.button("分析 STEP 模型"):
             step_result = analyze_step(step_file.getvalue(), selected_material, config, stock_allowance,
-                                       st.session_state.get("drawing_analysis"))
+                                       st.session_state.get("drawing_analysis"), tapping_mode.startswith("手动"))
             st.session_state["step_result"] = step_result
             if step_result.get("available"):
                 st.session_state["weight_input"] = round(step_result["actual_weight"], 3)
+                st.session_state["casting_weight_input"] = round(step_result["blank_weight"], 3)
                 for machine, hours in step_result["recommended_machine_hours"].items():
                     st.session_state[f"hours_{machine}"] = hours
                 st.session_state["manual_labor_hours_input"] = step_result.get("manual_labor_hours", 0.0)
@@ -423,7 +488,10 @@ def pricing_page(config: dict) -> None:
         with right:
             material = st.selectbox("材料", list(config["materials"]), key="material_input")
             weight = st.number_input("产品重量（kg）", min_value=0.0, value=float(st.session_state.get("weight_input", 0.0)), step=0.1, key="weight_input")
+            casting_weight = st.number_input("铸件计价重量（kg，材料成本按此重量计算）", min_value=0.0,
+                                             value=float(st.session_state.get("casting_weight_input", weight)), step=0.1, key="casting_weight_input")
             treatment = st.selectbox("表面处理", list(config["surface_treatments"]), key="treatment_input")
+            surface_cost_override = st.number_input("表面处理手动报价（元，0=按重量自动计算）", min_value=0.0, value=0.0, step=1.0)
             packaging_cost = st.number_input("包装费用（元）", min_value=0.0, value=0.0, step=1.0, key="packaging_input")
         st.subheader("设备加工工时（小时）")
         machine_cols = st.columns(len(config["machine_rates"]))
@@ -440,9 +508,9 @@ def pricing_page(config: dict) -> None:
             return
         data = {"customer": customer.strip(), "product_name": product_name.strip(), "product_number": product_number.strip(),
                 "quantity": int(quantity), "material": material, "weight": weight, "machine_hours": machine_hours,
-                "manual_labor_hours": manual_labor_hours,
-                "treatment": treatment, "packaging_cost": packaging_cost}
-        st.session_state["quote"] = (data, calculate(config, material, weight, machine_hours, manual_labor_hours, treatment, packaging_cost))
+                "manual_labor_hours": manual_labor_hours, "casting_weight": casting_weight,
+                "treatment": treatment, "packaging_cost": packaging_cost, "surface_cost_override": surface_cost_override}
+        st.session_state["quote"] = (data, calculate(config, material, weight, machine_hours, manual_labor_hours, casting_weight, treatment, packaging_cost, surface_cost_override))
     if "quote" in st.session_state:
         data, costs = st.session_state["quote"]
         st.subheader("报价结果")
