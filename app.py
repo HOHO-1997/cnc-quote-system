@@ -187,8 +187,10 @@ def analyze_drawing_text(text: str) -> dict:
     threaded_count = sum(int(count) for count in thread_groups)
     drilled_count = sum(int(count) for count, _ in hole_matches)
     min_tolerance = min(tolerance_values) if tolerance_values else None
-    # 仅图纸明确要求配磨/磨削时才自动安排磨床；公差或“等高”本身不能推断必须磨削。
-    requires_grinding = any(term in normalized for term in ["磨削", "配磨", "配对磨"])
+    # 配对件“等高”并带 0.01 mm 级精度时，通常需要两件同组磨削保证交付高度。
+    pair_height_requirement = ("等高" in normalized and any(term in normalized for term in ["两件", "2件", "每两", "配对", "成对"]))
+    # 图纸明确磨削/配磨，或“成对等高”要求，均视为磨床的强信号。
+    requires_grinding = any(term in normalized for term in ["磨削", "配磨", "配对磨"]) or pair_height_requirement
     suggestions, extra_hours = [], 0.0
     if min_tolerance is not None and min_tolerance <= 0.05:
         suggestions.append(f"检测到最严尺寸公差约 ±{min_tolerance:.3f} mm：建议增加精加工和专用量检具检验。")
@@ -202,6 +204,9 @@ def analyze_drawing_text(text: str) -> dict:
     if roughness and min(roughness) <= 1.6:
         suggestions.append("检测到 Ra1.6 或更高表面要求：建议精镗/精铣，必要时评估磨削工序。")
         extra_hours += 0.20
+    if pair_height_requirement:
+        suggestions.append("检测到两件/成对等高交付要求：应以同组配对磨削控制高度，报价中建议计入磨床工时。")
+        extra_hours += 0.35
     if threads:
         suggestions.append("检测到螺纹（" + "、".join(sorted(set(threads))[:5]) + "）：建议安排钻孔、攻牙或车螺纹工序。")
         extra_hours += 0.03 * max(threaded_count, len(threads))
@@ -211,7 +216,8 @@ def analyze_drawing_text(text: str) -> dict:
         extra_hours += 0.03 * hole_total
     return {"min_tolerance": min_tolerance, "gd_terms": gd_terms, "roughness": roughness,
             "threads": threads, "hole_matches": hole_matches, "threaded_count": threaded_count,
-            "drilled_count": drilled_count, "requires_grinding": requires_grinding, "suggestions": suggestions,
+            "drilled_count": drilled_count, "pair_height_requirement": pair_height_requirement,
+            "requires_grinding": requires_grinding, "suggestions": suggestions,
             "extra_hours": round(extra_hours, 2)}
 
 
@@ -278,6 +284,7 @@ def analyze_step(file_bytes: bytes, material: str, config: dict, stock_allowance
         drilled = (drawing_analysis or {}).get("drilled_count", 0)
         tight_tolerance = (drawing_analysis or {}).get("min_tolerance")
         requires_grinding = (drawing_analysis or {}).get("requires_grinding", False)
+        pair_height_requirement = (drawing_analysis or {}).get("pair_height_requirement", False)
         gd_terms = set((drawing_analysis or {}).get("gd_terms", []))
         roughness_values = (drawing_analysis or {}).get("roughness", [])
         is_large_frame = max_dim >= 1500 and (threads + drilled >= 80 or faces >= 500)
@@ -331,8 +338,9 @@ def analyze_step(file_bytes: bytes, material: str, config: dict, stock_allowance
         precision_plane_requirement = bool(gd_terms & {"平面度", "平行度"}) and tight_tolerance is not None and tight_tolerance <= 0.01
         very_fine_surface = bool(roughness_values) and min(roughness_values) <= 0.8
         if requires_grinding and max_dim <= 1000:
-            grinding_hours = 0.7 if max_dim <= 800 else 1.0
-            grinding_assessment = "图纸明确要求磨削/配磨，已计入磨床工时。"
+            grinding_hours = 0.35 if max_dim <= 500 else (0.7 if max_dim <= 800 else 1.0)
+            grinding_assessment = ("检测到两件/成对等高要求，需同组配对磨削保证交付高度，已计入磨床工时。"
+                                    if pair_height_requirement else "图纸明确要求磨削/配磨，已计入磨床工时。")
         elif (precision_plane_requirement or very_fine_surface) and 150 <= max_dim <= 800:
             grinding_hours = 0.7 if is_medium_bracket else 0.8
             grinding_assessment = "检测到中小型关键平面达到 0.01 mm 级形位精度或 Ra0.8 及更高要求，推荐磨床保证精度，已计入工时。"
