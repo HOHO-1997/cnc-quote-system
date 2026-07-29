@@ -22,11 +22,13 @@ DEFAULT_CONFIG = {
     "company_name": "机械加工厂",
     "profit_multiplier": 1.2,
     "materials": {"灰铁": 6.0, "球铁": 7.0, "铸铝": 36.0},
-    "densities": {"灰铁": 7.2, "球铁": 7.29, "铸铝": 2.7},  # g/cm³
+    "densities": {"灰铁": 7.4, "球铁": 7.6, "铸铝": 2.7},  # g/cm³
     "surface_treatments": {"无处理": 0.0, "喷砂": 2.0, "氧化": 7.0, "电泳": 10.0,
                            "黑漆": 0.5, "磷化": 4.0, "喷粉": 3.0, "喷漆": 2.0},
     "machine_rates": {"CNC加工中心": 90.0, "车床": 65.0, "龙门铣": 200.0, "卧式加工中心": 175.0, "磨床": 90.0},
     "manual_labor_rate": 35.0,
+    "annealing_rate": 2.0,
+    "casting_settlement_prices": {"灰铁": 0.0, "球铁": 0.0, "铸铝": 0.0},
     "default_stock_allowance_mm": 5.0,
     "casting_blank_factors": {"灰铁": 1.18, "球铁": 1.22, "铸铝": 1.12},
 }
@@ -46,8 +48,11 @@ def load_config() -> dict:
     # 兼容第一版参数文件，保留用户已维护的所有价格。
     changed = False
     config.setdefault("densities", DEFAULT_CONFIG["densities"])
-    if config["densities"].get("球铁") == 7.1:  # 兼容第二版旧默认值
-        config["densities"]["球铁"] = 7.29
+    if config["densities"].get("灰铁") == 7.2:
+        config["densities"]["灰铁"] = 7.4
+        changed = True
+    if config["densities"].get("球铁") in {7.1, 7.29}:  # 兼容旧默认值
+        config["densities"]["球铁"] = 7.6
         changed = True
     if "casting_blank_factors" not in config:
         config["casting_blank_factors"] = DEFAULT_CONFIG["casting_blank_factors"]
@@ -63,6 +68,12 @@ def load_config() -> dict:
         changed = True
     if "manual_labor_rate" not in config:
         config["manual_labor_rate"] = DEFAULT_CONFIG["manual_labor_rate"]
+        changed = True
+    if "annealing_rate" not in config:
+        config["annealing_rate"] = DEFAULT_CONFIG["annealing_rate"]
+        changed = True
+    if "casting_settlement_prices" not in config:
+        config["casting_settlement_prices"] = DEFAULT_CONFIG["casting_settlement_prices"]
         changed = True
     if changed:
         save_config(config)
@@ -267,6 +278,7 @@ def analyze_step(file_bytes: bytes, material: str, config: dict, stock_allowance
         tight_tolerance = (drawing_analysis or {}).get("min_tolerance")
         requires_grinding = (drawing_analysis or {}).get("requires_grinding", False)
         is_large_frame = max_dim >= 1500 and (threads + drilled >= 80 or faces >= 500)
+        is_medium_bracket = False
         if is_large_frame:
             # 按大型铸造机架批量加工工艺模板估算，避免把每个圆柱面都误当作独立孔。
             setup_hours = 5.0
@@ -332,15 +344,19 @@ def analyze_step(file_bytes: bytes, material: str, config: dict, stock_allowance
 
 def calculate(config: dict, material: str, weight: float, machine_hours: dict[str, float],
               manual_labor_hours: float, casting_weight: float, treatment: str, packaging_cost: float,
-              surface_cost_override: float = 0.0) -> dict:
-    material_cost = casting_weight * config["materials"][material]
+              surface_cost_override: float = 0.0, casting_settlement_price: float = 0.0,
+              annealing: bool = False) -> dict:
+    material_unit_price = casting_settlement_price if casting_settlement_price > 0 else config["materials"][material]
+    material_cost = casting_weight * material_unit_price
     machine_costs = {name: hours * config["machine_rates"][name] for name, hours in machine_hours.items()}
     cnc_cost = sum(machine_costs.values())
     manual_labor_cost = manual_labor_hours * float(config.get("manual_labor_rate", 35.0))
+    annealing_cost = casting_weight * float(config.get("annealing_rate", 2.0)) if annealing else 0.0
     surface_cost = surface_cost_override if surface_cost_override > 0 else weight * config["surface_treatments"][treatment]
-    total_cost = material_cost + cnc_cost + manual_labor_cost + surface_cost + packaging_cost
+    total_cost = material_cost + cnc_cost + manual_labor_cost + annealing_cost + surface_cost + packaging_cost
     return {"material_cost": material_cost, "machine_costs": machine_costs, "cnc_cost": cnc_cost,
-            "manual_labor_cost": manual_labor_cost, "surface_cost": surface_cost, "total_cost": total_cost,
+            "material_unit_price": material_unit_price, "manual_labor_cost": manual_labor_cost, "annealing_cost": annealing_cost,
+            "surface_cost": surface_cost, "total_cost": total_cost,
             "final_price": total_cost * config["profit_multiplier"]}
 
 
@@ -376,11 +392,12 @@ def quote_excel(data: dict, costs: dict, config: dict) -> bytes:
     info_rows = [["公司名称", config["company_name"]], ["报价日期", datetime.now().strftime("%Y-%m-%d")],
                  ["客户名称", data["customer"]], ["产品名称", data["product_name"]], ["产品编号", data["product_number"]],
                  ["数量", data["quantity"]], ["材料", data["material"]], ["产品净重 (kg)", data["weight"]], ["铸件计价重量 (kg)", data.get("casting_weight", data["weight"])],
+                 ["铸件结算单价（元/kg）", costs["material_unit_price"]], ["退火", "是" if data.get("annealing") else "否"],
                  ["表面处理", data["treatment"]]]
     cnc_rows = [[f"{name}（{data['machine_hours'][name]:.2f} 小时）", costs["machine_costs"][name]]
                 for name in data["machine_hours"] if data["machine_hours"][name] > 0]
     manual_row = [f"手动攻牙/辅助人工（{data.get('manual_labor_hours', 0.0):.2f} 小时 × ¥{config.get('manual_labor_rate', 35.0):.0f}）", costs["manual_labor_cost"]]
-    detail_rows = [["材料成本", costs["material_cost"]], *cnc_rows, ["设备加工成本合计", costs["cnc_cost"]], manual_row,
+    detail_rows = [["铸件材料成本", costs["material_cost"]], ["退火成本", costs["annealing_cost"]], *cnc_rows, ["设备加工成本合计", costs["cnc_cost"]], manual_row,
                    ["表面处理成本", costs["surface_cost"]], ["包装成本", data["packaging_cost"]], ["总成本", costs["total_cost"]],
                    ["利润系数", config["profit_multiplier"]], ["最终报价", costs["final_price"]]]
     output = BytesIO()
@@ -490,6 +507,9 @@ def pricing_page(config: dict) -> None:
             weight = st.number_input("产品重量（kg）", min_value=0.0, value=float(st.session_state.get("weight_input", 0.0)), step=0.1, key="weight_input")
             casting_weight = st.number_input("铸件计价重量（kg，材料成本按此重量计算）", min_value=0.0,
                                              value=float(st.session_state.get("casting_weight_input", weight)), step=0.1, key="casting_weight_input")
+            casting_settlement_price = st.number_input("铸件采购/结算单价（元/kg，0=按材料成本价）", min_value=0.0,
+                                                       value=float(config.get("casting_settlement_prices", {}).get(material, 0.0)), step=0.1)
+            annealing = st.checkbox(f"退火（¥{config.get('annealing_rate', 2.0):.2f}/kg，按铸件计价重量）")
             treatment = st.selectbox("表面处理", list(config["surface_treatments"]), key="treatment_input")
             surface_cost_override = st.number_input("表面处理手动报价（元，0=按重量自动计算）", min_value=0.0, value=0.0, step=1.0)
             packaging_cost = st.number_input("包装费用（元）", min_value=0.0, value=0.0, step=1.0, key="packaging_input")
@@ -509,12 +529,13 @@ def pricing_page(config: dict) -> None:
         data = {"customer": customer.strip(), "product_name": product_name.strip(), "product_number": product_number.strip(),
                 "quantity": int(quantity), "material": material, "weight": weight, "machine_hours": machine_hours,
                 "manual_labor_hours": manual_labor_hours, "casting_weight": casting_weight,
+                "casting_settlement_price": casting_settlement_price, "annealing": annealing,
                 "treatment": treatment, "packaging_cost": packaging_cost, "surface_cost_override": surface_cost_override}
-        st.session_state["quote"] = (data, calculate(config, material, weight, machine_hours, manual_labor_hours, casting_weight, treatment, packaging_cost, surface_cost_override))
+        st.session_state["quote"] = (data, calculate(config, material, weight, machine_hours, manual_labor_hours, casting_weight, treatment, packaging_cost, surface_cost_override, casting_settlement_price, annealing))
     if "quote" in st.session_state:
         data, costs = st.session_state["quote"]
         st.subheader("报价结果")
-        metrics = [("材料成本", costs["material_cost"]), *[(f"{n}成本", v) for n, v in costs["machine_costs"].items() if v],
+        metrics = [("铸件材料成本", costs["material_cost"]), ("退火成本", costs["annealing_cost"]), *[(f"{n}成本", v) for n, v in costs["machine_costs"].items() if v],
                    ("设备加工合计", costs["cnc_cost"]), ("手动攻牙/人工", costs["manual_labor_cost"]), ("表面处理成本", costs["surface_cost"]),
                    ("包装成本", data["packaging_cost"]), ("总成本", costs["total_cost"]), ("最终报价", costs["final_price"])]
         for start in range(0, len(metrics), 3):
@@ -547,6 +568,10 @@ def settings_page(config: dict) -> None:
         profit = st.number_input("利润系数", min_value=0.01, value=float(config["profit_multiplier"]), step=0.05)
         st.subheader("材料单价（元/kg）")
         materials = {n: st.number_input(n, min_value=0.0, value=float(v), step=0.5, key=f"m_{n}") for n, v in config["materials"].items()}
+        st.caption("以上是自制铸造的原料成本单价。若购买外协铸件，请维护下方的铸件结算单价。")
+        settlement_prices = {n: st.number_input(f"{n}铸件采购/结算单价", min_value=0.0,
+                             value=float(config.get("casting_settlement_prices", {}).get(n, 0.0)), step=0.1, key=f"cp_{n}")
+                             for n in config["materials"]}
         st.subheader("材料密度（g/cm³）")
         densities = {n: st.number_input(n, min_value=0.1, value=float(v), step=0.01, key=f"d_{n}") for n, v in config["densities"].items()}
         st.subheader("铸件毛坯重量系数（局部加工余量）")
@@ -555,12 +580,15 @@ def settings_page(config: dict) -> None:
         rates = {n: st.number_input(n, min_value=0.0, value=float(v), step=5.0, key=f"r_{n}") for n, v in config["machine_rates"].items()}
         manual_labor_rate = st.number_input("手动攻牙/辅助人工单价（元/小时）", min_value=0.0,
                                             value=float(config.get("manual_labor_rate", 35.0)), step=5.0)
+        annealing_rate = st.number_input("退火单价（元/kg）", min_value=0.0,
+                                         value=float(config.get("annealing_rate", 2.0)), step=0.1)
         st.subheader("表面处理单价（元/kg）")
         treatments = {n: st.number_input(n, min_value=0.0, value=float(v), step=0.5, key=f"s_{n}") for n, v in config["surface_treatments"].items()}
         if st.form_submit_button("保存参数", type="primary"):
             save_config({"company_name": company_name, "profit_multiplier": profit, "materials": materials,
                          "densities": densities, "machine_rates": rates, "surface_treatments": treatments,
-                         "manual_labor_rate": manual_labor_rate,
+                         "manual_labor_rate": manual_labor_rate, "annealing_rate": annealing_rate,
+                         "casting_settlement_prices": settlement_prices,
                          "default_stock_allowance_mm": config.get("default_stock_allowance_mm", 5.0),
                          "casting_blank_factors": blank_factors})
             st.success("参数已保存。")
