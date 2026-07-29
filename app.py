@@ -230,7 +230,7 @@ def analyze_step(file_bytes: bytes, material: str, config: dict, stock_allowance
         from OCP.BRepGProp import BRepGProp
         from OCP.Bnd import Bnd_Box
         from OCP.GProp import GProp_GProps
-        from OCP.GeomAbs import GeomAbs_BSplineSurface, GeomAbs_Cylinder
+        from OCP.GeomAbs import GeomAbs_BSplineSurface, GeomAbs_Cylinder, GeomAbs_Plane
         from OCP.IFSelect import IFSelect_RetDone
         from OCP.STEPControl import STEPControl_Reader
         from OCP.TopAbs import TopAbs_FACE
@@ -260,12 +260,17 @@ def analyze_step(file_bytes: bytes, material: str, config: dict, stock_allowance
             return {"available": False, "message": "模型未检测到封闭实体，无法计算真实体积和重量。"}
 
         faces = cylinders = spline_faces = 0
+        largest_planar_area_mm2 = 0.0
         explorer = TopExp_Explorer(shape, TopAbs_FACE)
         while explorer.More():
             faces += 1
             surface = BRepAdaptor_Surface(TopoDS.Face_s(explorer.Current()), True)
             if surface.GetType() == GeomAbs_Cylinder: cylinders += 1
             if surface.GetType() == GeomAbs_BSplineSurface: spline_faces += 1
+            if surface.GetType() == GeomAbs_Plane:
+                face_props = GProp_GProps()
+                BRepGProp.SurfaceProperties_s(TopoDS.Face_s(explorer.Current()), face_props)
+                largest_planar_area_mm2 = max(largest_planar_area_mm2, face_props.Mass())
             explorer.Next()
         density = float(config["densities"].get(material, 7.0))
         weight_kg = volume_mm3 * density / 1_000_000
@@ -334,16 +339,25 @@ def analyze_step(file_bytes: bytes, material: str, config: dict, stock_allowance
         primary = "龙门铣" if max_dim > 1000 else ("卧式加工中心" if max_dim > 800 or weight_kg > 500 else "CNC加工中心")
         recommended[primary] = round(total_hours, 2)
         grinding_hours = 0.0
+        grinding_pair_hours = 0.0
+        largest_planar_area_m2 = largest_planar_area_mm2 / 1_000_000
         grinding_assessment = "未检测到必须使用磨床的明确证据，建议由 CNC/龙门完成精加工。"
         precision_plane_requirement = bool(gd_terms & {"平面度", "平行度"}) and tight_tolerance is not None and tight_tolerance <= 0.01
         very_fine_surface = bool(roughness_values) and min(roughness_values) <= 0.8
         if requires_grinding and max_dim <= 1000:
-            grinding_hours = 0.35 if max_dim <= 500 else (0.7 if max_dim <= 800 else 1.0)
-            grinding_assessment = ("检测到两件/成对等高要求，需同组配对磨削保证交付高度，已计入磨床工时。"
-                                    if pair_height_requirement else "图纸明确要求磨削/配磨，已计入磨床工时。")
+            # 面积以 STEP 中最大平面为基础；0.01 mm 级要求增加精磨与测量时间。
+            precision_factor = 0.20 if tight_tolerance is not None and tight_tolerance <= 0.01 else 0.0
+            if pair_height_requirement:
+                grinding_pair_hours = max(0.6, 0.55 + largest_planar_area_m2 * 2.0 + precision_factor)
+                grinding_hours = grinding_pair_hours / 2.0  # 报价按单件分摊，实际两件同组磨削
+                grinding_assessment = (f"检测到两件/成对等高要求：最大关键平面约 {largest_planar_area_m2:.3f} m²，"
+                                        f"预计一对磨削约 {grinding_pair_hours:.1f} 小时，已按单件 {grinding_hours:.2f} 小时计入。")
+            else:
+                grinding_hours = max(0.3, 0.3 + largest_planar_area_m2 * 2.0 + precision_factor)
+                grinding_assessment = f"图纸明确要求磨削/配磨：最大关键平面约 {largest_planar_area_m2:.3f} m²，已按面积与精度计入磨床工时。"
         elif (precision_plane_requirement or very_fine_surface) and 150 <= max_dim <= 800:
-            grinding_hours = 0.7 if is_medium_bracket else 0.8
-            grinding_assessment = "检测到中小型关键平面达到 0.01 mm 级形位精度或 Ra0.8 及更高要求，推荐磨床保证精度，已计入工时。"
+            grinding_hours = max(0.4, 0.3 + largest_planar_area_m2 * 2.0 + (0.20 if precision_plane_requirement else 0.0))
+            grinding_assessment = f"检测到中小型关键平面精度要求：最大关键平面约 {largest_planar_area_m2:.3f} m²，推荐磨床保证精度，已计入工时。"
         elif (requires_grinding or precision_plane_requirement or very_fine_surface) and max_dim > 800:
             grinding_assessment = "检测到高精度平面要求，但零件尺寸较大，普通磨床可能装不下；未自动计费，请评估精密龙门、五面加工或外协大型磨床。"
         if grinding_hours > 0 and "磨床" in recommended:
@@ -352,6 +366,7 @@ def analyze_step(file_bytes: bytes, material: str, config: dict, stock_allowance
         return {"available": True, "dimensions": dimensions, "blank_dimensions": blank_dimensions, "stock_allowance_mm": stock_allowance_mm,
                 "volume_mm3": volume_mm3, "actual_weight": weight_kg, "blank_weight": blank_weight_kg,
                 "faces": faces, "cylinders": cylinders, "spline_faces": spline_faces, "removal_cm3": removal_cm3,
+                "largest_planar_area_m2": largest_planar_area_m2, "grinding_pair_hours": round(grinding_pair_hours, 2),
                 "difficulty": difficulty, "recommended_machine_hours": recommended, "source": "STEP 实体体积",
                 "primary_machine": primary, "finish_hours": round(finish_hours, 2),
                 "grinding_assessment": grinding_assessment, "time_breakdown": time_breakdown, "manual_labor_hours": round(manual_tapping_hours, 1), "batch_hours": round(total_hours + grinding_hours, 1),
