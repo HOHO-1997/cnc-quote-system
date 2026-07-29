@@ -22,11 +22,12 @@ DEFAULT_CONFIG = {
     "company_name": "机械加工厂",
     "profit_multiplier": 1.2,
     "materials": {"灰铁": 6.0, "球铁": 7.0, "铸铝": 36.0},
-    "densities": {"灰铁": 7.2, "球铁": 7.1, "铸铝": 2.7},  # g/cm³
+    "densities": {"灰铁": 7.2, "球铁": 7.29, "铸铝": 2.7},  # g/cm³
     "surface_treatments": {"无处理": 0.0, "喷砂": 2.0, "氧化": 7.0, "电泳": 10.0,
                            "黑漆": 0.5, "磷化": 4.0, "喷粉": 3.0, "喷漆": 2.0},
     "machine_rates": {"CNC加工中心": 90.0, "车床": 65.0, "龙门铣": 200.0, "卧式加工中心": 175.0},
     "default_stock_allowance_mm": 5.0,
+    "casting_blank_factors": {"灰铁": 1.18, "球铁": 1.22, "铸铝": 1.12},
 }
 
 
@@ -42,11 +43,20 @@ def load_config() -> dict:
     with CONFIG_FILE.open("r", encoding="utf-8") as file:
         config = json.load(file)
     # 兼容第一版参数文件，保留用户已维护的所有价格。
+    changed = False
     config.setdefault("densities", DEFAULT_CONFIG["densities"])
+    if config["densities"].get("球铁") == 7.1:  # 兼容第二版旧默认值
+        config["densities"]["球铁"] = 7.29
+        changed = True
+    if "casting_blank_factors" not in config:
+        config["casting_blank_factors"] = DEFAULT_CONFIG["casting_blank_factors"]
+        changed = True
     if "machine_rates" not in config:
         old_rate = config.pop("cnc_rate", 60.0)
         config["machine_rates"] = {"CNC加工中心": 90.0, "车床": 65.0,
                                    "龙门铣": 200.0, "卧式加工中心": 175.0}
+        changed = True
+    if changed:
         save_config(config)
     return config
 
@@ -109,14 +119,18 @@ def extract_pdf_info(file_bytes: bytes) -> tuple[dict, str]:
 def analyze_drawing_text(text: str) -> dict:
     """从 2D 图纸文字提取精度/工艺信号，作为工时复核依据。"""
     normalized = re.sub(r"\s+", "", text)
-    bilateral = re.findall(r"±([0-9]+(?:\.[0-9]+)?)", normalized)
-    unilateral = re.findall(r"[+−-]([0-9]+(?:\.[0-9]+)?)", normalized)
+    # 对 PDF 文字保留空格/换行做数量与公差解析，避免“8 x M5”粘连成错误大数字。
+    bilateral = re.findall(r"±\s*([0-9]+(?:\.[0-9]+)?)\b", text)
+    unilateral = re.findall(r"[+−-]\s*([0-9]+(?:\.[0-9]+)?)\b", text)
     tolerance_values = [float(value) for value in bilateral + unilateral]
     fit_matches = re.findall(r"(?:[A-Za-z]\d{1,2}|\d{1,2}[a-z])", normalized)
     gd_terms = [term for term in ["平面度", "平行度", "垂直度", "同轴度", "位置度", "圆跳动", "全跳动"] if term in normalized]
     roughness = [float(value) for value in re.findall(r"(?:RA|Ra|粗糙度)[：:≤]*([0-9]+(?:\.[0-9]+)?)", text)]
-    threads = re.findall(r"M\d+(?:[×xX]\d+(?:\.\d+)?)?(?:-[0-9A-Za-z]+)?", normalized)
-    hole_matches = re.findall(r"(\d+)\s*[-×xX]\s*[ΦØ]\s*([0-9]+(?:\.[0-9]+)?)", normalized)
+    threads = re.findall(r"M\s*\d+(?:[×xX]\s*\d+(?:\.\d+)?)?(?:\s*[-]\s*[0-9A-Za-z]+)?", text, flags=re.IGNORECASE)
+    hole_matches = re.findall(r"(?m)(\d+)\s*[-×xX]\s*[ΦØ]\s*([0-9]+(?:\.\d+)?)", text)
+    thread_groups = re.findall(r"(?m)(\d+)\s*[-×xX]\s*M\s*\d+", text, flags=re.IGNORECASE)
+    threaded_count = sum(int(count) for count in thread_groups)
+    drilled_count = sum(int(count) for count, _ in hole_matches)
     min_tolerance = min(tolerance_values) if tolerance_values else None
     suggestions, extra_hours = [], 0.0
     if min_tolerance is not None and min_tolerance <= 0.05:
@@ -133,17 +147,19 @@ def analyze_drawing_text(text: str) -> dict:
         extra_hours += 0.20
     if threads:
         suggestions.append("检测到螺纹（" + "、".join(sorted(set(threads))[:5]) + "）：建议安排钻孔、攻牙或车螺纹工序。")
-        extra_hours += 0.08 * len(threads)
+        extra_hours += 0.03 * max(threaded_count, len(threads))
     if hole_matches:
-        hole_total = sum(int(count) for count, _ in hole_matches)
+        hole_total = drilled_count
         suggestions.append(f"检测到约 {hole_total} 个成组孔：建议计入钻孔/扩孔/倒角工时。")
         extra_hours += 0.03 * hole_total
     return {"min_tolerance": min_tolerance, "gd_terms": gd_terms, "roughness": roughness,
-            "threads": threads, "hole_matches": hole_matches, "suggestions": suggestions,
+            "threads": threads, "hole_matches": hole_matches, "threaded_count": threaded_count,
+            "drilled_count": drilled_count, "suggestions": suggestions,
             "extra_hours": round(extra_hours, 2)}
 
 
-def analyze_step(file_bytes: bytes, material: str, config: dict, stock_allowance_mm: float) -> dict:
+def analyze_step(file_bytes: bytes, material: str, config: dict, stock_allowance_mm: float,
+                 drawing_analysis: dict | None = None) -> dict:
     """使用 OpenCascade 读取 STEP 实体，取得真实体积、尺寸及基础加工特征。"""
     try:
         from OCP.BRepAdaptor import BRepAdaptor_Surface
@@ -190,25 +206,53 @@ def analyze_step(file_bytes: bytes, material: str, config: dict, stock_allowance
             explorer.Next()
         density = float(config["densities"].get(material, 7.0))
         weight_kg = volume_mm3 * density / 1_000_000
+        # 铸件不是外接长方体：只在加工面保留余量，用成品重量倍率估算毛坯。
+        # 避免将镂空框架的整个外接包络误算成数吨实心毛坯。
+        blank_factor = float(config.get("casting_blank_factors", {}).get(material, 1.20))
+        blank_weight_kg = weight_kg * blank_factor
+        removal_cm3 = (blank_weight_kg - weight_kg) * 1_000_000 / density
         blank_dimensions = [dimension + 2 * stock_allowance_mm for dimension in dimensions]
-        stock_volume = blank_dimensions[0] * blank_dimensions[1] * blank_dimensions[2]
-        removal_cm3 = max(0.0, stock_volume - volume_mm3) / 1000
-        blank_weight_kg = stock_volume * density / 1_000_000
         max_dim = max(dimensions)
         difficulty_score = faces + cylinders * 3 + spline_faces * 7 + (8 if max_dim > 1000 else 0)
-        # 基础工时模型：装夹编程 + 去除材料 + 面/孔/曲面特征；参数可在后续版本独立维护。
-        setup_hours = 0.45 + (0.25 if max_dim > 500 else 0) + (0.35 if max_dim > 1000 else 0)
-        rough_hours = removal_cm3 / (2200 if material == "铸铝" else 1300)
-        finish_hours = faces * 0.012
-        hole_hours = cylinders * 0.055
-        contour_hours = spline_faces * 0.12
-        inspection_hours = 0.10 + (0.15 if difficulty_score >= 30 else 0)
-        total_hours = max(0.25, setup_hours + rough_hours + finish_hours + hole_hours + contour_hours + inspection_hours)
+        threads = (drawing_analysis or {}).get("threaded_count", 0)
+        drilled = (drawing_analysis or {}).get("drilled_count", 0)
+        tight_tolerance = (drawing_analysis or {}).get("min_tolerance")
+        is_large_frame = max_dim >= 1500 and (threads + drilled >= 80 or faces >= 500)
+        if is_large_frame:
+            # 按大型铸造机架批量加工工艺模板估算，避免把每个圆柱面都误当作独立孔。
+            setup_hours = 5.0
+            rough_hours = 9.0 + max(0.0, removal_cm3 - 30_000) / 6_000
+            finish_hours = 9.0 + (2.0 if tight_tolerance and tight_tolerance <= 0.01 else 0.5)
+            side_end_hours = 8.0
+            boring_hours = 5.0
+            hole_hours = min(15.0, 2.5 + threads * 0.045 + drilled * 0.025)
+            contour_hours = 0.0
+            inspection_hours = 4.0 + (1.5 if tight_tolerance and tight_tolerance <= 0.01 else 0.0)
+            total_hours = setup_hours + rough_hours + finish_hours + side_end_hours + boring_hours + hole_hours + inspection_hours
+            time_breakdown = {"上机找正与装夹": setup_hours, "粗铣基准与主要平面": rough_hours,
+                              "精铣导轨/安装面": finish_hours, "侧面及端面加工": side_end_hours,
+                              "大孔扩孔与精镗": boring_hours, "钻孔攻牙": hole_hours,
+                              "机内测量、去毛刺与检验": inspection_hours}
+            first_piece_hours = total_hours + 12.0
+            process_template = "大型铸造机架（批量龙门加工）"
+        else:
+            setup_hours = 0.45 + (0.25 if max_dim > 500 else 0) + (0.35 if max_dim > 1000 else 0)
+            rough_hours = removal_cm3 / (2200 if material == "铸铝" else 1300)
+            finish_hours = faces * 0.012
+            hole_hours = min(cylinders * 0.055, 2.5 + threads * 0.045 + drilled * 0.025) if drawing_analysis else cylinders * 0.055
+            contour_hours = spline_faces * 0.12
+            inspection_hours = 0.10 + (0.15 if difficulty_score >= 30 else 0)
+            total_hours = max(0.25, setup_hours + rough_hours + finish_hours + hole_hours + contour_hours + inspection_hours)
+            time_breakdown = {"装夹与编程": setup_hours, "粗加工（去除材料）": rough_hours,
+                              "精加工（平面/轮廓）": finish_hours, "孔/圆柱特征": hole_hours,
+                              "自由曲面": contour_hours, "检验与去毛刺": inspection_hours}
+            first_piece_hours = total_hours + (4.0 if max_dim > 500 else 1.5)
+            process_template = "通用铸件加工"
         difficulty = "高" if difficulty_score >= 80 else ("中" if difficulty_score >= 30 else "低")
         recommended = {name: 0.0 for name in config["machine_rates"]}
         primary = "龙门铣" if max_dim > 1000 else ("卧式加工中心" if max_dim > 500 or weight_kg > 50 else "CNC加工中心")
         recommended[primary] = round(total_hours, 2)
-        if cylinders >= 4 and "车床" in recommended:
+        if not is_large_frame and cylinders >= 4 and "车床" in recommended:
             lathe_hours = round(min(total_hours * 0.45, 0.3 + cylinders * 0.035), 2)
             recommended["车床"] = lathe_hours
             recommended[primary] = round(max(0.15, total_hours - lathe_hours), 2)
@@ -216,9 +260,8 @@ def analyze_step(file_bytes: bytes, material: str, config: dict, stock_allowance
                 "volume_mm3": volume_mm3, "actual_weight": weight_kg, "blank_weight": blank_weight_kg,
                 "faces": faces, "cylinders": cylinders, "spline_faces": spline_faces, "removal_cm3": removal_cm3,
                 "difficulty": difficulty, "recommended_machine_hours": recommended, "source": "STEP 实体体积",
-                "time_breakdown": {"装夹与编程": setup_hours, "粗加工（去除材料）": rough_hours,
-                                   "精加工（平面/轮廓）": finish_hours, "孔/圆柱特征": hole_hours,
-                                   "自由曲面": contour_hours, "检验与去毛刺": inspection_hours}}
+                "time_breakdown": time_breakdown, "batch_hours": round(total_hours, 1),
+                "first_piece_hours": round(first_piece_hours, 1), "process_template": process_template}
     except Exception as error:
         return {"available": False, "message": f"STEP 几何分析失败：{error}"}
     finally:
@@ -309,7 +352,8 @@ def pricing_page(config: dict) -> None:
             except Exception as error:
                 st.error(f"PDF 读取失败：{error}")
         if step_file and st.button("分析 STEP 模型"):
-            step_result = analyze_step(step_file.getvalue(), selected_material, config, stock_allowance)
+            step_result = analyze_step(step_file.getvalue(), selected_material, config, stock_allowance,
+                                       st.session_state.get("drawing_analysis"))
             st.session_state["step_result"] = step_result
             if step_result.get("available"):
                 st.session_state["weight_input"] = round(step_result["actual_weight"], 3)
@@ -330,14 +374,15 @@ def pricing_page(config: dict) -> None:
                 f"实体体积 {step_result['volume_mm3'] / 1000:.1f} cm³；重量 {step_result['actual_weight']:.3f} kg；"
                 f"加工难度 {step_result['difficulty']}。")
         blank_dims = step_result["blank_dimensions"]
-        st.success(f"毛坯估算（每侧余量 {step_result['stock_allowance_mm']:.1f} mm）："
-                   f"{blank_dims[0]:.1f} × {blank_dims[1]:.1f} × {blank_dims[2]:.1f} mm，"
-                   f"毛坯重量 {step_result['blank_weight']:.3f} kg，预计去除 {step_result['removal_cm3']:.1f} cm³。")
+        st.success(f"铸件毛坯估算（局部加工面余量，非外接实心方料）："
+                   f"外形参考 {blank_dims[0]:.1f} × {blank_dims[1]:.1f} × {blank_dims[2]:.1f} mm，"
+                   f"毛坯重量 {step_result['blank_weight']:.1f} kg，预计加工去除 {step_result['removal_cm3']:.0f} cm³。")
         st.caption(f"特征识别：{step_result['faces']} 个面、{step_result['cylinders']} 个圆柱面、"
                    f"{step_result['spline_faces']} 个自由曲面；建议按下方自动带入的工时复核。")
-        st.write("自动工时构成（小时，仅作工艺员复核起点）：")
+        st.write(f"自动工时构成 - {step_result['process_template']}（小时，仅作工艺员复核起点）：")
         st.dataframe(pd.DataFrame(list(step_result["time_breakdown"].items()), columns=["工序", "建议工时（小时）"]),
                      hide_index=True, use_container_width=True)
+        st.info(f"建议批量占机：{step_result['batch_hours']:.1f} 小时；首件含编程/工艺准备：{step_result['first_piece_hours']:.1f} 小时。")
 
     with st.form("quote_form"):
         left, right = st.columns(2)
@@ -401,14 +446,19 @@ def settings_page(config: dict) -> None:
         profit = st.number_input("利润系数", min_value=0.01, value=float(config["profit_multiplier"]), step=0.05)
         st.subheader("材料单价（元/kg）")
         materials = {n: st.number_input(n, min_value=0.0, value=float(v), step=0.5, key=f"m_{n}") for n, v in config["materials"].items()}
+        st.subheader("材料密度（g/cm³）")
+        densities = {n: st.number_input(n, min_value=0.1, value=float(v), step=0.01, key=f"d_{n}") for n, v in config["densities"].items()}
+        st.subheader("铸件毛坯重量系数（局部加工余量）")
+        blank_factors = {n: st.number_input(n, min_value=1.0, value=float(v), step=0.01, key=f"b_{n}") for n, v in config["casting_blank_factors"].items()}
         st.subheader("设备工时单价（元/小时）")
         rates = {n: st.number_input(n, min_value=0.0, value=float(v), step=5.0, key=f"r_{n}") for n, v in config["machine_rates"].items()}
         st.subheader("表面处理单价（元/kg）")
         treatments = {n: st.number_input(n, min_value=0.0, value=float(v), step=0.5, key=f"s_{n}") for n, v in config["surface_treatments"].items()}
         if st.form_submit_button("保存参数", type="primary"):
             save_config({"company_name": company_name, "profit_multiplier": profit, "materials": materials,
-                         "densities": config["densities"], "machine_rates": rates, "surface_treatments": treatments,
-                         "default_stock_allowance_mm": config.get("default_stock_allowance_mm", 5.0)})
+                         "densities": densities, "machine_rates": rates, "surface_treatments": treatments,
+                         "default_stock_allowance_mm": config.get("default_stock_allowance_mm", 5.0),
+                         "casting_blank_factors": blank_factors})
             st.success("参数已保存。")
 
 
