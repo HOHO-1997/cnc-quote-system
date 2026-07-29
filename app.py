@@ -210,7 +210,10 @@ def analyze_step(file_bytes: bytes, material: str, config: dict, stock_allowance
         # 避免将镂空框架的整个外接包络误算成数吨实心毛坯。
         blank_factor = float(config.get("casting_blank_factors", {}).get(material, 1.20))
         blank_weight_kg = weight_kg * blank_factor
-        removal_cm3 = (blank_weight_kg - weight_kg) * 1_000_000 / density
+        # density uses g/cm³: mass difference (kg) must be converted to grams
+        # before converting it to cm³.  Using 1,000,000 here inflated removal
+        # volume (and therefore roughing time) by 1,000 times.
+        removal_cm3 = (blank_weight_kg - weight_kg) * 1_000 / density
         blank_dimensions = [dimension + 2 * stock_allowance_mm for dimension in dimensions]
         max_dim = max(dimensions)
         difficulty_score = faces + cylinders * 3 + spline_faces * 7 + (8 if max_dim > 1000 else 0)
