@@ -134,6 +134,28 @@ def pricing_page(config: dict) -> None:
     st.caption(f"公式估算 {formula_time:.2f} h；历史相似产品修正 {formula_time * cal['factor']:.2f} h（系数 {cal['factor']:.2f}）；最终仍以已确认工序为准。")
     for cols in [[("单件成本", result["unit_cost"]), ("单件报价", result["unit_price"]), ("一次性费用", result["one_time_cost"])], [("整批成本", result["batch_cost"]), ("整批报价", result["batch_price"]), ("设备加工（单件）", result["equipment_per_unit"])]]:
         for col, (label, value) in zip(st.columns(3), cols): col.metric(label, f"¥ {value:,.2f}")
+    st.subheader("单件成本明细")
+    material_label = "铸件成本" if result["quote_mode"] == "成本加利润" else "铸件直接销售价"
+    material_detail = pd.DataFrame([{
+        "项目": material_label, "计算方式": f"{data['casting_weight']:.2f} kg × ¥{result['material_rate']:.2f}/kg",
+        "单件金额（元）": round(result["casting_per_unit"], 2), "说明": "毛坯计价重量"}])
+    st.dataframe(material_detail, use_container_width=True, hide_index=True)
+    process_details = []
+    rate_map = config["machine_rates"] if result["quote_mode"] == "成本加利润" else config.get("direct_machine_rates", config["machine_rates"])
+    for row in result["confirmed_rows"]:
+        equipment = row["推荐设备"]; hours = float(row["推荐时间(h)"]); rate = float(rate_map.get(equipment, config.get("manual_labor_rate", 35)))
+        process_details.append({"工序": row["工序"], "设备": equipment, "工时(h)": hours, "小时单价（元）": rate,
+                                "加工费（元）": round(hours * rate, 2), "类型": row.get("类型", "基础"), "判断依据": row.get("判断依据", "")})
+    st.subheader("加工费明细（单件）")
+    st.dataframe(pd.DataFrame(process_details), use_container_width=True, hide_index=True)
+    other_details = [{"项目": "表面处理合计", "单件金额（元）": round(result["surface_per_unit"], 2), "说明": "多选处理、最低收费及附加费"},
+                     {"项目": "包装", "单件金额（元）": round(result["packaging_per_unit"], 2), "说明": data["packaging_mode"]},
+                     {"项目": "一次性费用", "单件金额（元）": round(result["one_time_cost"], 2), "说明": "整批编程/夹具/模具/首件检测等，不分摊到单件"}]
+    for item in result.get("additional_details", []):
+        other_details.append({"项目": item["名称"], "单件金额（元）": round(item["金额"], 2), "说明": item["方式"]})
+    st.subheader("表面处理、其他费用与一次性费用")
+    st.dataframe(pd.DataFrame(other_details), use_container_width=True, hide_index=True)
+    st.subheader("已确认工序与识别依据")
     st.dataframe(pd.DataFrame(result["confirmed_rows"]), use_container_width=True, hide_index=True)
     left, right = st.columns(2)
     if left.button("保存报价", type="primary"): save_quote(data, result, config); st.success("已保存历史报价。")

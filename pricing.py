@@ -59,6 +59,7 @@ def calculate_quote(data: dict, rows: list[dict], config: dict, additional: list
     extra_time = sum(float(row.get("推荐时间(h)", 0)) for row in extra_rows)
     return {"unit_cost": unit_cost, "unit_price": unit_price, "batch_cost": batch_cost, "batch_price": batch_price,
             "one_time_cost": batch_extra, "casting_per_unit": casting_per_unit, "equipment_per_unit": equipment_per_unit,
+            "material_rate": raw_material_rate if mode == "成本加利润" else sale_rate,
             "surface_per_unit": surface_per_unit, "packaging_per_unit": packaging_per_unit, "machine_costs": machine_costs,
             "base_time": base_time, "extra_time": extra_time, "surface_details": surface_details,
             "additional_details": additional_details, "confirmed_rows": confirmed_rows, "quote_mode": mode}
