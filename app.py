@@ -182,6 +182,7 @@ def analyze_drawing_text(text: str) -> dict:
     gd_terms = [term for term in ["平面度", "平行度", "垂直度", "同轴度", "位置度", "圆跳动", "全跳动"] if term in normalized]
     roughness = [float(value) for value in re.findall(r"(?:RA|Ra|粗糙度)[：:≤]*([0-9]+(?:\.[0-9]+)?)", text)]
     threads = re.findall(r"M\s*\d+(?:[×xX]\s*\d+(?:\.\d+)?)?(?:\s*[-]\s*[0-9A-Za-z]+)?", text, flags=re.IGNORECASE)
+    thread_diameters = [int(value) for value in re.findall(r"M\s*(\d+)", text, flags=re.IGNORECASE)]
     hole_matches = re.findall(r"(?m)(\d+)\s*[-×xX]\s*[ΦØ]\s*([0-9]+(?:\.\d+)?)", text)
     thread_groups = re.findall(r"(?m)(\d+)\s*[-×xX]\s*M\s*\d+", text, flags=re.IGNORECASE)
     threaded_count = sum(int(count) for count in thread_groups)
@@ -189,6 +190,9 @@ def analyze_drawing_text(text: str) -> dict:
     min_tolerance = min(tolerance_values) if tolerance_values else None
     # 配对件“等高”并带 0.01 mm 级精度时，通常需要两件同组磨削保证交付高度。
     pair_height_requirement = ("等高" in normalized and any(term in normalized for term in ["两件", "2件", "每两", "配对", "成对"]))
+    # 大直径螺纹、同轴孔、密封槽属于典型车床/车铣复合特征；圆柱面数量本身不作为判断依据。
+    requires_turning = (any(diameter >= 40 for diameter in thread_diameters) or
+                        any(term in normalized for term in ["密封槽", "同轴孔", "车削", "车床", "外圆"]))
     # 图纸明确磨削/配磨，或“成对等高”要求，均视为磨床的强信号。
     requires_grinding = any(term in normalized for term in ["磨削", "配磨", "配对磨"]) or pair_height_requirement
     suggestions, extra_hours = [], 0.0
@@ -216,7 +220,8 @@ def analyze_drawing_text(text: str) -> dict:
         extra_hours += 0.03 * hole_total
     return {"min_tolerance": min_tolerance, "gd_terms": gd_terms, "roughness": roughness,
             "threads": threads, "hole_matches": hole_matches, "threaded_count": threaded_count,
-            "drilled_count": drilled_count, "pair_height_requirement": pair_height_requirement,
+            "thread_diameters": thread_diameters, "drilled_count": drilled_count, "requires_turning": requires_turning,
+            "pair_height_requirement": pair_height_requirement,
             "requires_grinding": requires_grinding, "suggestions": suggestions,
             "extra_hours": round(extra_hours, 2)}
 
@@ -289,11 +294,13 @@ def analyze_step(file_bytes: bytes, material: str, config: dict, stock_allowance
         drilled = (drawing_analysis or {}).get("drilled_count", 0)
         tight_tolerance = (drawing_analysis or {}).get("min_tolerance")
         requires_grinding = (drawing_analysis or {}).get("requires_grinding", False)
+        requires_turning = (drawing_analysis or {}).get("requires_turning", False)
         pair_height_requirement = (drawing_analysis or {}).get("pair_height_requirement", False)
         gd_terms = set((drawing_analysis or {}).get("gd_terms", []))
         roughness_values = (drawing_analysis or {}).get("roughness", [])
         is_large_frame = max_dim >= 1500 and (threads + drilled >= 80 or faces >= 500)
         is_medium_bracket = False
+        is_small_valve = max_dim <= 250 and weight_kg <= 10 and requires_turning
         if is_large_frame:
             # 按大型铸造机架批量加工工艺模板估算，避免把每个圆柱面都误当作独立孔。
             setup_hours = 5.0
@@ -332,12 +339,28 @@ def analyze_step(file_bytes: bytes, material: str, config: dict, stock_allowance
                               "精加工（平面/轮廓）": finish_hours, "设备钻孔/扩孔/镗孔": drilling_hours,
                               ("手动攻牙（人工）" if manual_tapping else "设备刚性攻牙"): tapping_hours,
                               "自由曲面": contour_hours, "检验与去毛刺": inspection_hours}
+            if is_small_valve:
+                # 小型阀体：铸造内腔保留，不能按 STEP 全部面数当作铣削面；车削与立加分工核算。
+                setup_hours, rough_hours, finish_hours = 0.15, 0.18, 0.22
+                drilling_hours, tapping_hours, contour_hours, inspection_hours = 0.28, 0.10, 0.0, 0.10
+                manual_tapping_hours = tapping_hours if manual_tapping else 0.0
+                total_hours = 0.95  # CNC：法兰面、侧孔、小孔、换装与机内检测
+                if manual_tapping:
+                    total_hours -= tapping_hours
+                time_breakdown = {"CNC 装夹、法兰面与精孔": 0.35, "侧面孔、小孔与斜孔": 0.35,
+                                  ("手动攻牙（人工）" if manual_tapping else "设备刚性攻牙"): tapping_hours,
+                                  "换装、找正与机内检测": 0.15}
             first_piece_hours = total_hours + (4.0 if max_dim > 500 else 1.5)
-            process_template = "通用铸件加工"
+            process_template = "小型阀体（车床 + CNC）" if is_small_valve else "通用铸件加工"
         difficulty = "高" if difficulty_score >= 80 else ("中" if difficulty_score >= 30 else "低")
         recommended = {name: 0.0 for name in config["machine_rates"]}
         primary = "龙门铣" if max_dim > 1000 else ("卧式加工中心" if max_dim > 800 or weight_kg > 500 else "CNC加工中心")
         recommended[primary] = round(total_hours, 2)
+        turning_hours = 0.0
+        if is_small_valve and "车床" in recommended:
+            turning_hours = 0.55  # 两端同轴孔、端面、台阶、密封槽和 M72 等大螺纹
+            recommended["车床"] = turning_hours
+            time_breakdown["车床：两端端面/同轴孔/密封槽/大螺纹"] = turning_hours
         grinding_hours = 0.0
         grinding_pair_hours = 0.0
         largest_planar_area_m2 = largest_planar_area_mm2 / 1_000_000
@@ -369,8 +392,8 @@ def analyze_step(file_bytes: bytes, material: str, config: dict, stock_allowance
                 "largest_planar_area_m2": largest_planar_area_m2, "grinding_pair_hours": round(grinding_pair_hours, 2),
                 "difficulty": difficulty, "recommended_machine_hours": recommended, "source": "STEP 实体体积",
                 "primary_machine": primary, "finish_hours": round(finish_hours, 2),
-                "grinding_assessment": grinding_assessment, "time_breakdown": time_breakdown, "manual_labor_hours": round(manual_tapping_hours, 1), "batch_hours": round(total_hours + grinding_hours, 1),
-                "first_piece_hours": round(first_piece_hours + grinding_hours, 1), "process_template": process_template}
+                "grinding_assessment": grinding_assessment, "time_breakdown": time_breakdown, "manual_labor_hours": round(manual_tapping_hours, 1), "batch_hours": round(total_hours + turning_hours + grinding_hours, 1),
+                "first_piece_hours": round(first_piece_hours + turning_hours + grinding_hours, 1), "process_template": process_template}
     except Exception as error:
         return {"available": False, "message": f"STEP 几何分析失败：{error}"}
     finally:
