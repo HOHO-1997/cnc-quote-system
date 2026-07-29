@@ -187,7 +187,8 @@ def analyze_drawing_text(text: str) -> dict:
     threaded_count = sum(int(count) for count in thread_groups)
     drilled_count = sum(int(count) for count, _ in hole_matches)
     min_tolerance = min(tolerance_values) if tolerance_values else None
-    requires_grinding = any(term in normalized for term in ["磨削", "配磨", "配对磨", "等高", "磨床"])
+    # 仅图纸明确要求配磨/磨削时才自动安排磨床；公差或“等高”本身不能推断必须磨削。
+    requires_grinding = any(term in normalized for term in ["磨削", "配磨", "配对磨"])
     suggestions, extra_hours = [], 0.0
     if min_tolerance is not None and min_tolerance <= 0.05:
         suggestions.append(f"检测到最严尺寸公差约 ±{min_tolerance:.3f} mm：建议增加精加工和专用量检具检验。")
@@ -277,6 +278,8 @@ def analyze_step(file_bytes: bytes, material: str, config: dict, stock_allowance
         drilled = (drawing_analysis or {}).get("drilled_count", 0)
         tight_tolerance = (drawing_analysis or {}).get("min_tolerance")
         requires_grinding = (drawing_analysis or {}).get("requires_grinding", False)
+        gd_terms = set((drawing_analysis or {}).get("gd_terms", []))
+        roughness_values = (drawing_analysis or {}).get("roughness", [])
         is_large_frame = max_dim >= 1500 and (threads + drilled >= 80 or faces >= 500)
         is_medium_bracket = False
         if is_large_frame:
@@ -324,16 +327,26 @@ def analyze_step(file_bytes: bytes, material: str, config: dict, stock_allowance
         primary = "龙门铣" if max_dim > 1000 else ("卧式加工中心" if max_dim > 800 or weight_kg > 500 else "CNC加工中心")
         recommended[primary] = round(total_hours, 2)
         grinding_hours = 0.0
-        if (requires_grinding or (is_medium_bracket and tight_tolerance and tight_tolerance <= 0.01)) and "磨床" in recommended:
-            grinding_hours = 0.7 if is_medium_bracket else 1.0
+        grinding_assessment = "未检测到必须使用磨床的明确证据，建议由 CNC/龙门完成精加工。"
+        precision_plane_requirement = bool(gd_terms & {"平面度", "平行度"}) and tight_tolerance is not None and tight_tolerance <= 0.01
+        very_fine_surface = bool(roughness_values) and min(roughness_values) <= 0.8
+        if requires_grinding and max_dim <= 1000:
+            grinding_hours = 0.7 if max_dim <= 800 else 1.0
+            grinding_assessment = "图纸明确要求磨削/配磨，已计入磨床工时。"
+        elif (precision_plane_requirement or very_fine_surface) and 150 <= max_dim <= 800:
+            grinding_hours = 0.7 if is_medium_bracket else 0.8
+            grinding_assessment = "检测到中小型关键平面达到 0.01 mm 级形位精度或 Ra0.8 及更高要求，推荐磨床保证精度，已计入工时。"
+        elif (requires_grinding or precision_plane_requirement or very_fine_surface) and max_dim > 800:
+            grinding_assessment = "检测到高精度平面要求，但零件尺寸较大，普通磨床可能装不下；未自动计费，请评估精密龙门、五面加工或外协大型磨床。"
+        if grinding_hours > 0 and "磨床" in recommended:
             recommended["磨床"] = grinding_hours
-            time_breakdown["配对磨/磨削（磨床）"] = grinding_hours
+            time_breakdown["磨削/配磨（磨床）"] = grinding_hours
         return {"available": True, "dimensions": dimensions, "blank_dimensions": blank_dimensions, "stock_allowance_mm": stock_allowance_mm,
                 "volume_mm3": volume_mm3, "actual_weight": weight_kg, "blank_weight": blank_weight_kg,
                 "faces": faces, "cylinders": cylinders, "spline_faces": spline_faces, "removal_cm3": removal_cm3,
                 "difficulty": difficulty, "recommended_machine_hours": recommended, "source": "STEP 实体体积",
                 "primary_machine": primary, "finish_hours": round(finish_hours, 2),
-                "time_breakdown": time_breakdown, "manual_labor_hours": round(manual_tapping_hours, 1), "batch_hours": round(total_hours + grinding_hours, 1),
+                "grinding_assessment": grinding_assessment, "time_breakdown": time_breakdown, "manual_labor_hours": round(manual_tapping_hours, 1), "batch_hours": round(total_hours + grinding_hours, 1),
                 "first_piece_hours": round(first_piece_hours + grinding_hours, 1), "process_template": process_template}
     except Exception as error:
         return {"available": False, "message": f"STEP 几何分析失败：{error}"}
@@ -416,7 +429,7 @@ def pricing_page(config: dict) -> None:
     with st.expander("图纸与模型辅助（可选）"):
         pdf_file = st.file_uploader("上传 PDF 图纸（提取图号、产品名称、材料、重量、数量）", type=["pdf"])
         dxf_file = st.file_uploader("上传 CAD DXF 图纸（提取文字、图号、产品名称、材料）", type=["dxf"])
-        st.caption("目前支持 PDF 与 DXF。DWG 请先在 AutoCAD 中“另存为 DXF”后上传；网页端不能可靠直接读取原始 DWG。")
+        st.caption("目前支持 PDF、DXF 与 STEP：仅保留能实际提取文字或分析几何的格式。")
         step_file = st.file_uploader("上传 STEP/3D 模型（.step / .stp，估算重量与加工难度）", type=["step", "stp"])
         selected_material = st.session_state.get("material_input", list(config["materials"])[0])
         tapping_mode = st.radio("攻牙方式", ["设备刚性攻牙（计设备机时）", "手动攻牙（计人工 ¥35/小时）"], horizontal=True)
@@ -481,6 +494,7 @@ def pricing_page(config: dict) -> None:
         st.dataframe(pd.DataFrame(list(step_result["time_breakdown"].items()), columns=["工序", "建议工时（小时）"]),
                      hide_index=True, use_container_width=True)
         st.info(f"建议批量设备占机：{step_result['batch_hours']:.1f} 小时；手动攻牙/辅助人工：{step_result.get('manual_labor_hours', 0.0):.1f} 小时；首件含编程/工艺准备：{step_result['first_piece_hours']:.1f} 小时（设备机时）。")
+        st.caption(f"磨床评估：{step_result.get('grinding_assessment', '未进行磨床评估。')}")
         finish_options = [name for name in ["龙门铣", "卧式加工中心"] if name in config["machine_rates"]]
         if finish_options:
             default_finish_machine = step_result.get("primary_machine", finish_options[0])
