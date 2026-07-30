@@ -103,6 +103,23 @@ class RegressionTests(unittest.TestCase):
         one_piece = calculate_quote({**data, "quantity": 1}, rows, DEFAULT_CONFIG, [], [], include_tiers=False)
         self.assertAlmostEqual(result["tapping_labor_hours_per_unit"], one_piece["tapping_labor_hours_per_unit"])
 
+    def test_enabled_base_operations_and_manual_tapping_are_all_billed(self):
+        rows = [
+            {"工序": "粗铣", "计算类型": "每件", "推荐设备": "CNC加工中心", "单件时间(h)": 0.372, "启用": True, "用户确认": False},
+            {"工序": "精铣", "计算类型": "每件", "推荐设备": "CNC加工中心", "单件时间(h)": 1.056, "启用": True, "用户确认": False},
+            {"工序": "钻孔", "计算类型": "每件", "推荐设备": "CNC加工中心", "单件时间(h)": 0.15, "启用": True, "用户确认": False},
+            {"工序": "倒角", "计算类型": "每件", "推荐设备": "CNC加工中心", "单件时间(h)": 0.08, "启用": True, "用户确认": False},
+            {"工序": "M4 螺纹加工", "计算类型": "每件", "推荐设备": "人工工位", "攻牙设备": "CNC加工中心", "数量": 30,
+             "单件时间(h)": 0.012, "人工单孔时间(h)": 0.03, "攻牙方式": "人工攻牙", "启用": True, "用户确认": False},
+        ]
+        data = {"quantity": 1, "material": "灰铁", "net_weight": 1, "casting_weight": 1.2, "quote_mode": "成本加利润", "packaging_mode": "单件费用"}
+        result = calculate_quote(data, rows, DEFAULT_CONFIG, [], [])
+        self.assertEqual(result["enabled_operation_count"], 5)
+        self.assertEqual(result["final_billed_operation_count"], 5)
+        self.assertAlmostEqual(result["equipment_per_unit"], (0.372 + 1.056 + 0.15 + 0.08) * 90, places=2)
+        self.assertAlmostEqual(result["tapping_labor_per_unit"], 0.90 * 35, places=2)
+        self.assertAlmostEqual(result["raw_processing_per_unit"], 180.72, places=2)
+
 
 if __name__ == "__main__":
     unittest.main()
