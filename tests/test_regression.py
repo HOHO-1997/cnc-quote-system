@@ -4,6 +4,8 @@ from config import DEFAULT_CONFIG
 from export import quote_excel
 from machining_estimator import estimate_operations
 from pricing import calculate_quote
+from drawing_analyzer import analyze_drawing, normalize_engineering_text
+from step_analyzer import group_coaxial_cylinders
 
 
 def step(dimensions, weight, blank, plane=0.2, groups=None):
@@ -12,6 +14,49 @@ def step(dimensions, weight, blank, plane=0.2, groups=None):
 
 
 class RegressionTests(unittest.TestCase):
+    def test_engineering_annotation_normalization_separates_threads_and_holes(self):
+        text = "M 7 2 X 1 . 5 - 6 H\n4 - \u00d8 7 . 1 0 \u901a\n2 - \u00d8 2 . 4 +0.05/-0.00 \u6df14.5\n\u00d8 2 1 +0.01/-0.03\n\u00b10.000"
+        normalized = normalize_engineering_text(text)
+        drawing = analyze_drawing(text)
+        self.assertIn("M72\u00d71.5-6H", normalized)
+        self.assertEqual(drawing["thread_groups"][0]["\u89c4\u683c"], "M72\u00d71.5-6H")
+        self.assertEqual(drawing["threaded_count"], 1)
+        holes = {round(item["diameter"], 2): item for item in drawing["hole_features"]}
+        self.assertEqual(holes[7.1]["count"], 4)
+        self.assertTrue(holes[7.1]["through"])
+        self.assertEqual(holes[2.4]["count"], 2)
+        self.assertFalse(holes[2.4]["through"])
+        self.assertNotIn(0.0, drawing["dimensional_tolerances"])
+
+    def test_coaxial_grouping_allows_different_axis_origins(self):
+        records = [
+            {"radius": 36, "area": 100, "direction": (0, 0, 1), "origin": (0, 0, 0)},
+            {"radius": 25, "area": 90, "direction": (0, 0, -1), "origin": (0, 0, 30)},
+            {"radius": 20, "area": 80, "direction": (0.001, 0, 1), "origin": (0.2, 0, 70)},
+            {"radius": 4, "area": 10, "direction": (1, 0, 0), "origin": (50, 0, 0)},
+        ]
+        groups = group_coaxial_cylinders(records)
+        self.assertEqual(groups[0]["count"], 3)
+        self.assertIn(72.0, groups[0]["diameters"])
+
+    def test_valve_route_has_lathe_and_no_forced_hmc(self):
+        drawing = {"threaded_count": 1, "drilled_count": 6, "thread_diameters": [72], "min_tolerance": 0.02,
+                   "gd_terms": [], "hole_features": [{"diameter": 7.1, "count": 4, "through": True}, {"diameter": 2.4, "count": 2, "through": False}],
+                   "requires_turning": True, "extra_sources": []}
+        groups = [{"area": 100, "count": 4, "diameters": [72, 69.6, 64, 50]}]
+        result = estimate_operations(step([152, 135, 93], 3.4, 4.1, 0.02, groups), drawing, DEFAULT_CONFIG, product_type="\u5c0f\u578b\u9600\u4f53")
+        lathe = sum(row["\u63a8\u8350\u65f6\u95f4(h)"] for row in result["rows"] if row["\u63a8\u8350\u8bbe\u5907"] == "\u8f66\u5e8a")
+        cnc = sum(row["\u63a8\u8350\u65f6\u95f4(h)"] for row in result["rows"] if row["\u63a8\u8350\u8bbe\u5907"] == "CNC\u52a0\u5de5\u4e2d\u5fc3")
+        self.assertGreaterEqual(lathe, 0.55); self.assertLessEqual(lathe, 0.9)
+        self.assertGreaterEqual(cnc, 0.7); self.assertLessEqual(cnc, 1.0)
+        self.assertFalse(any(row["\u63a8\u8350\u8bbe\u5907"] == "\u5367\u5f0f\u52a0\u5de5\u4e2d\u5fc3" for row in result["rows"]))
+
+    def test_box_multiside_features_prefer_hmc(self):
+        drawing = {"threaded_count": 0, "drilled_count": 18, "side_feature_count": 3, "cross_wall_coaxial": True,
+                   "horizontal_deep_holes": True, "gd_terms": ["\u4f4d\u7f6e\u5ea6"], "hole_features": [], "extra_sources": []}
+        result = estimate_operations(step([600, 500, 400], 120, 145, 0.2), drawing, DEFAULT_CONFIG, product_type="\u7bb1\u4f53/\u591a\u65b9\u5411\u5b54\u7cfb")
+        self.assertEqual(result["classification"], "\u7bb1\u4f53/\u591a\u65b9\u5411\u5b54\u7cfb")
+        self.assertTrue(any(row["\u63a8\u8350\u8bbe\u5907"] == "\u5367\u5f0f\u52a0\u5de5\u4e2d\u5fc3" for row in result["rows"]))
     def test_large_frame_is_gantry_not_lathe(self):
         drawing = {"threaded_count": 150, "drilled_count": 100, "min_tolerance": 0.01, "gd_terms": ["平行度"], "hole_features": [], "requires_turning": False, "extra_sources": []}
         result = estimate_operations(step([2050, 765, 460], 1080, 1320, 0.8), drawing, DEFAULT_CONFIG)
