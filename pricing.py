@@ -155,6 +155,7 @@ def calculate_quote(data: dict, rows: list[dict], config: dict, additional: list
             "pure_cutting_time": pure_cutting, "loading_time": loading, "batch_preparation_time": batch_prepare,
             "batch_equipment_time": sum(s["整批设备时间(h)"] for s in schedules), "pair_warning": pair_warning,
             "surface_details": surface_details, "additional_details": additional_details, "confirmed_rows": confirmed_rows, "quote_mode": mode,
+            "input_operation_count": len(rows), "enabled_operation_count": len(confirmed_rows), "final_billed_operation_count": len(schedules),
             "batch_efficiency": 1.0}
     if include_tiers:
         sample_quantity = max(1, int(_number(data.get("sample_quantity", 1), 1)))

@@ -80,7 +80,12 @@ def _normalize_and_validate_operations(rows: list[dict]) -> tuple[list[dict], li
         process = str(row.get("工序", ""))
         if "螺纹加工" not in process:
             # 只有精度/检验“追加”工序仍允许通过复选框选择是否启用；基础工序随确认按钮带入。
-            row["启用"] = bool(row.get("用户确认", False)) if row.get("类型") == "追加" else True
+            if row.get("类型") == "追加":
+                row["启用"] = bool(row.get("启用", row.get("用户确认", False)))
+                row["用户确认"] = row["启用"]
+            else:
+                row["启用"] = True
+                row["用户确认"] = True
             normalized.append(row)
             continue
         total = max(0, int(float(row.get("数量", 0) or 0)))
@@ -215,11 +220,16 @@ def pricing_page(config: dict) -> None:
                 "fixture_count": fixture_count, "sample_quantity": sample_quantity, "tier_rows": tier_editor.to_dict("records"), "material": material, "net_weight": net_weight, "casting_weight": casting_weight, "quote_mode": quote_mode,
                 "casting_sales_rate": sale_rate, "packaging_mode": packaging_mode, "packaging_cost": packaging_cost, "surface_area_m2": step.get("total_planar_area_m2", 0.0), "surfaces": surfaces.to_dict("records")}
         result = calculate_quote(data, rows, config, additional.to_dict("records"), surfaces.to_dict("records"))
+        result["auto_identified_operation_count"] = len(st.session_state.get("analysis_rows", []))
+        if result["final_billed_operation_count"] < result["enabled_operation_count"]:
+            st.error(f"计价工序异常：启用 {result['enabled_operation_count']} 项，但最终仅计价 {result['final_billed_operation_count']} 项。已阻止生成报价，请重新确认工序。")
+            return
         st.session_state["tier_rows"] = data["tier_rows"]
         st.session_state["quote"] = (data, result, additional.to_dict("records"))
     if "quote" not in st.session_state: return
     data, result, _ = st.session_state["quote"]
     st.subheader("报价总览")
+    st.caption(f"自动识别工序数：{result.get('auto_identified_operation_count', result['input_operation_count'])}；确认工序数：{len(result['confirmed_rows'])}；启用工序数：{result['enabled_operation_count']}；最终计价工序数：{result['final_billed_operation_count']}。")
     st.caption("打样与批量报价使用不同的数量分摊一次性费用；未确认的精度/检验或攻牙工序不会计入报价。")
     cal = calibration(data["product_type"])
     formula_time = result["base_time"] + result["extra_time"]
