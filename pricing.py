@@ -85,7 +85,9 @@ def calculate_quote(data: dict, rows: list[dict], config: dict, additional: list
     material = data["material"]; blank_weight = float(data.get("casting_weight", data.get("net_weight", 0))); net_weight = float(data.get("net_weight", 0))
     rate_map = config["machine_rates"] if mode == "成本加利润" else config.get("direct_machine_rates", config["machine_rates"])
     manual_rate = float(config.get("manual_labor_rate", 35.0))
-    confirmed_rows = [row for row in rows if bool(row.get("用户确认", False))]
+    # rows 已经来自“确认带入报价”后的 confirmed_operations；不再因旧复选框二次过滤。
+    # 仅精度/检验等明确标为未启用的追加工序不进入报价。
+    confirmed_rows = [row for row in rows if bool(row.get("启用", True))]
     processing_discount = _processing_discount(config, quantity)
     schedules = []
     for row in confirmed_rows:

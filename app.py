@@ -76,6 +76,8 @@ def _normalize_and_validate_operations(rows: list[dict]) -> tuple[list[dict], li
         row = dict(raw)
         process = str(row.get("工序", ""))
         if "螺纹加工" not in process:
+            # 只有精度/检验“追加”工序仍允许通过复选框选择是否启用；基础工序随确认按钮带入。
+            row["启用"] = bool(row.get("用户确认", False)) if row.get("类型") == "追加" else True
             normalized.append(row)
             continue
         total = max(0, int(float(row.get("数量", 0) or 0)))
@@ -84,16 +86,21 @@ def _normalize_and_validate_operations(rows: list[dict]) -> tuple[list[dict], li
         row["攻牙设备"] = original_machine
         if mode == "设备刚性攻牙":
             row["设备攻牙数量"], row["人工攻牙数量"], row["推荐设备"] = total, 0, original_machine
+            row["用户确认"], row["启用"] = True, True
         elif mode == "人工攻牙":
             row["设备攻牙数量"], row["人工攻牙数量"], row["推荐设备"] = 0, total, "人工工位"
+            row["用户确认"], row["启用"] = True, True
         elif mode == "无螺纹加工":
             row["设备攻牙数量"], row["人工攻牙数量"] = 0, 0
+            row["用户确认"], row["启用"] = True, True
         elif mode == "混合攻牙":
             device = int(float(row.get("设备攻牙数量", 0) or 0)); manual = int(float(row.get("人工攻牙数量", 0) or 0))
             if device + manual != total:
                 errors.append(f"第 {index} 行 {process}：设备攻牙数量与人工攻牙数量之和必须等于 {total}。")
             if device < 0 or manual < 0:
                 errors.append(f"第 {index} 行 {process}：攻牙数量不能为负数。")
+            if not errors or not any(process in error for error in errors):
+                row["用户确认"], row["启用"] = True, True
         else:
             errors.append(f"第 {index} 行 {process}：请选择攻牙方式。")
         if mode == "人工攻牙" and (total <= 0 or float(row.get("人工单孔时间(h)", 0) or 0) <= 0):
@@ -117,14 +124,21 @@ def confirmation_panel(config: dict) -> None:
                                                  "攻牙方式": "无螺纹加工", "设备攻牙数量": 0, "人工攻牙数量": 0,
                                                  "人工单孔时间(h)": 0.03, "手动总价(元)": 0.0,
                                                  "判断依据": "人工录入", "置信度": "人工", "类型": "基础", "用户确认": False}]
-    edited = st.data_editor(pd.DataFrame(st.session_state["analysis_rows"]), use_container_width=True, hide_index=True,
+    editor_rows = []
+    for raw in st.session_state["analysis_rows"]:
+        row = dict(raw)
+        row["启用"] = bool(row.get("启用", row.get("用户确认", False))) if row.get("类型") == "追加" else True
+        row.pop("用户确认", None)  # 不再让螺纹行额外漏勾“用户确认”而被报价过滤
+        editor_rows.append(row)
+    edited = st.data_editor(pd.DataFrame(editor_rows), use_container_width=True, hide_index=True,
                             num_rows="dynamic", column_config={
                                 "推荐设备": st.column_config.SelectboxColumn(options=[*list(config["machine_rates"]), "人工工位"]),
                                 "计算类型": st.column_config.SelectboxColumn(options=["每件", "每批一次", "每对产品", "手动总价"]),
                                 "攻牙方式": st.column_config.SelectboxColumn(options=["待确认", "无螺纹加工", "设备刚性攻牙", "人工攻牙", "混合攻牙"]),
-                                "用户确认": st.column_config.CheckboxColumn()}, key="operation_editor")
+                                "启用": st.column_config.CheckboxColumn(help="基础工序和有效攻牙方式会自动启用；仅追加工序可关闭。")}, key="operation_editor")
     # 编辑后但尚未确认时，旧报价立即作废，避免用户误把修改前的攻牙方式拿去报价。
-    if st.session_state.get("confirmed_operations") and edited.to_dict("records") != st.session_state["confirmed_operations"]:
+    edited_rows, edited_errors = _normalize_and_validate_operations(edited.to_dict("records"))
+    if st.session_state.get("confirmed_operations") and not edited_errors and edited_rows != st.session_state["confirmed_operations"]:
         st.session_state.pop("quote", None)
         st.info("工序表已修改，请点击“确认带入报价”后重新计算。")
     if st.button("确认带入报价", type="primary"):
