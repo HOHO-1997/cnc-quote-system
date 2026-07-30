@@ -59,6 +59,9 @@ def drawing_and_step_panel(config: dict) -> None:
             if step.get("available"):
                 estimate = estimate_operations(step, st.session_state.get("drawing", {}), config)
                 st.session_state["estimate"] = estimate; st.session_state["analysis_rows"] = estimate["rows"]; st.session_state["confirmed_operations"] = []
+                # 新图纸/模型必须丢弃旧 data_editor 缓存，否则可能把上一张图的局部行带入本次确认。
+                st.session_state.pop("operation_editor", None)
+                st.session_state.pop("quote", None)
                 st.success("已生成自动识别结果，请在下方确认后带入报价。")
             else: st.warning(step.get("message"))
     drawing, step = st.session_state.get("drawing", {}), st.session_state.get("step", {})
@@ -107,6 +110,16 @@ def _normalize_and_validate_operations(rows: list[dict]) -> tuple[list[dict], li
             errors.append(f"第 {index} 行 {process}：人工攻牙数量和单孔时间必须大于 0。")
         normalized.append(row)
     return normalized, errors
+
+
+def _restore_missing_base_operations(confirmed: list[dict], identified: list[dict]) -> tuple[list[dict], bool]:
+    """防止 data_editor 缓存仅保存攻牙行而遗漏自动识别的基础设备工序。"""
+    has_base = any(row.get("类型") != "追加" and "螺纹加工" not in str(row.get("工序", "")) for row in confirmed)
+    source_base = [row for row in identified if row.get("类型") != "追加" and "螺纹加工" not in str(row.get("工序", ""))]
+    if has_base or not source_base:
+        return confirmed, False
+    restored, _ = _normalize_and_validate_operations(source_base)
+    return [*confirmed, *restored], True
 
 
 def confirmation_panel(config: dict) -> None:
@@ -194,6 +207,10 @@ def pricing_page(config: dict) -> None:
         if not rows:
             st.warning("请先在“自动识别结果确认表”点击“确认带入报价”。报价只读取已确认工序。")
             return
+        rows, restored = _restore_missing_base_operations(rows, st.session_state.get("analysis_rows", []))
+        if restored:
+            st.session_state["confirmed_operations"] = rows
+            st.warning("检测到确认数据遗漏了自动识别的基础设备工序，已补回粗加工、精加工、钻孔等基础工序；请复核后保存报价。")
         data = {"customer": customer, "product_name": product_name, "product_number": product_number, "quantity": quantity, "product_type": product_type,
                 "fixture_count": fixture_count, "sample_quantity": sample_quantity, "tier_rows": tier_editor.to_dict("records"), "material": material, "net_weight": net_weight, "casting_weight": casting_weight, "quote_mode": quote_mode,
                 "casting_sales_rate": sale_rate, "packaging_mode": packaging_mode, "packaging_cost": packaging_cost, "surface_area_m2": step.get("total_planar_area_m2", 0.0), "surfaces": surfaces.to_dict("records")}
