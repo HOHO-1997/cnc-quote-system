@@ -28,6 +28,16 @@ class RegressionTests(unittest.TestCase):
         self.assertFalse(holes[2.4]["through"])
         self.assertNotIn(0.0, drawing["dimensional_tolerances"])
 
+    def test_valve_pdf_extracted_diameter_symbol_and_spaced_digits(self):
+        # 真实 PyPDF 文本形态：使用 ∅，并把直径数字和公差拆到多行。
+        text = "M 7 2 X1.5 - 6 H\n4 - \u2205 7 .1 0 \u00b1 0 .1 0 \u901a\n2 - \u2205 2.4 + 0.0 5\n- 0.0 0 4 .5\n\u2205 21 + 0.01\n- 0.03"
+        drawing = analyze_drawing(text)
+        self.assertEqual(drawing["thread_groups"], [{"\u89c4\u683c": "M72\u00d71.5-6H", "\u6570\u91cf": 1, "\u76f4\u5f84": 72.0}])
+        features = {round(item["diameter"], 2): item for item in drawing["hole_features"]}
+        self.assertEqual(features[7.1]["count"], 4)
+        self.assertTrue(features[7.1]["through"])
+        self.assertEqual(features[2.4]["count"], 2)
+
     def test_coaxial_grouping_allows_different_axis_origins(self):
         records = [
             {"radius": 36, "area": 100, "direction": (0, 0, 1), "origin": (0, 0, 0)},
