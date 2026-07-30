@@ -74,9 +74,34 @@ class RegressionTests(unittest.TestCase):
         result = calculate_quote(data, rows, DEFAULT_CONFIG, [{"启用": True, "项目": "首件检测费", "计价方式": "整批一次性费用", "金额": 243}], [])
         self.assertAlmostEqual(result["additional_one_time_cost"], 243)
         self.assertAlmostEqual(result["one_time_per_unit"], 2.43)
-        self.assertAlmostEqual(result["batch_cost"], result["repeated_per_unit_cost"] * 100 + 243)
+        self.assertAlmostEqual(result["batch_cost"], (result["nonprocessing_per_unit"] + result["discounted_processing_per_unit"]) * 100 + 243)
         self.assertGreater(result["sample_unit_price"], result["unit_price"])
         self.assertGreater(len(quote_excel(data, result, DEFAULT_CONFIG)), 1000)
+
+    def test_manual_tapping_58_holes_is_labor_not_cnc(self):
+        groups = [("M4-A", 18), ("M4-B", 8), ("M4-C", 12), ("M10", 8), ("M4-D", 12)]
+        rows = []
+        for name, count in groups:
+            rows.append({"工序": f"{name} 螺纹底孔", "计算类型": "每件", "推荐设备": "CNC加工中心", "数量": count,
+                         "单件时间(h)": count * 0.01, "用户确认": True})
+            rows.append({"工序": f"{name} 螺纹加工", "计算类型": "每件", "推荐设备": "CNC加工中心", "攻牙设备": "CNC加工中心",
+                         "数量": count, "单件时间(h)": 0.012, "人工单孔时间(h)": 0.03, "攻牙方式": "人工攻牙", "用户确认": True})
+        data = {"quantity": 100, "sample_quantity": 1, "tier_rows": [{"数量": 100}], "material": "灰铁", "net_weight": 1,
+                "casting_weight": 1.2, "quote_mode": "成本加利润", "packaging_mode": "单件费用"}
+        result = calculate_quote(data, rows, DEFAULT_CONFIG, [{"启用": True, "项目": "首件检测费", "计价方式": "整批一次性费用", "金额": 243}], [])
+        tapping = [x for x in result["operation_schedules"] if "螺纹加工" in x["工序"]]
+        bottom_holes = [x for x in result["operation_schedules"] if "螺纹底孔" in x["工序"]]
+        self.assertAlmostEqual(result["tapping_labor_hours_per_unit"], 1.74)
+        self.assertAlmostEqual(result["tapping_labor_per_unit"], 60.90)
+        self.assertAlmostEqual(sum(x["人工金额(元)"] for x in tapping), 6090.0)
+        self.assertTrue(all(x["设备"] == "人工工位" and x["整批设备时间(h)"] == 0 for x in tapping))
+        self.assertGreater(sum(x["整批设备时间(h)"] for x in bottom_holes), 0)
+        self.assertAlmostEqual(result["processing_discount"], 0.85)
+        self.assertAlmostEqual(result["one_time_per_unit"], 2.43)
+        self.assertAlmostEqual(result["casting_per_unit"], 7.20)  # 材料没有参与 85% 加工费折扣
+        # 折扣仅作用于金额，真实设备/人工工时在 1 件和 100 件时按数量线性增长。
+        one_piece = calculate_quote({**data, "quantity": 1}, rows, DEFAULT_CONFIG, [], [], include_tiers=False)
+        self.assertAlmostEqual(result["tapping_labor_hours_per_unit"], one_piece["tapping_labor_hours_per_unit"])
 
 
 if __name__ == "__main__":
