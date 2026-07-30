@@ -99,6 +99,7 @@ class RegressionTests(unittest.TestCase):
         self.assertAlmostEqual(result["processing_discount"], 0.85)
         self.assertAlmostEqual(result["one_time_per_unit"], 2.43)
         self.assertAlmostEqual(result["casting_per_unit"], 7.20)  # 材料没有参与 85% 加工费折扣
+        self.assertAlmostEqual(result["other_per_unit"], 0.0)
         # 折扣仅作用于金额，真实设备/人工工时在 1 件和 100 件时按数量线性增长。
         one_piece = calculate_quote({**data, "quantity": 1}, rows, DEFAULT_CONFIG, [], [], include_tiers=False)
         self.assertAlmostEqual(result["tapping_labor_hours_per_unit"], one_piece["tapping_labor_hours_per_unit"])
