@@ -15,7 +15,8 @@ class RegressionTests(unittest.TestCase):
         drawing = {"threaded_count": 150, "drilled_count": 100, "min_tolerance": 0.01, "gd_terms": ["平行度"], "hole_features": [], "requires_turning": False, "extra_sources": []}
         result = estimate_operations(step([2050, 765, 460], 1080, 1320, 0.8), drawing, DEFAULT_CONFIG)
         rows = result["rows"]
-        gantry = sum(x["推荐时间(h)"] for x in rows if x["推荐设备"] == "龙门铣")
+        quote = calculate_quote({"quantity": 1, "material": "球铁", "net_weight": 1080, "casting_weight": 1320, "quote_mode": "成本加利润", "packaging_mode": "单件费用"}, rows, DEFAULT_CONFIG, [], [])
+        gantry = quote["batch_equipment_time"]
         self.assertEqual(result["classification"], "大型机架/床身")
         self.assertGreaterEqual(gantry, 48)
         self.assertLessEqual(gantry, 65)
@@ -36,13 +37,32 @@ class RegressionTests(unittest.TestCase):
         times = {m: sum(x["推荐时间(h)"] for x in result["rows"] if x["推荐设备"] == m) for m in ["车床", "CNC加工中心"]}
         self.assertEqual(result["classification"], "小型阀体")
         self.assertAlmostEqual(times["车床"], 0.55, places=2)
-        self.assertAlmostEqual(times["CNC加工中心"], 0.95, places=2)
+        # 螺纹方式默认“待确认”，因此自动基础时间不把攻牙悄悄计入报价。
+        self.assertAlmostEqual(times["CNC加工中心"], 0.85, places=2)
 
     def test_quantity_and_one_time_price(self):
         rows = [{"工序": "CNC", "推荐设备": "CNC加工中心", "推荐时间(h)": 1, "类型": "基础", "用户确认": True}]
         data = {"quantity": 10, "material": "灰铁", "net_weight": 2, "casting_weight": 2.4, "quote_mode": "成本加利润", "packaging_mode": "整批费用", "packaging_cost": 100, "surface_area_m2": 0}
         result = calculate_quote(data, rows, DEFAULT_CONFIG, [{"启用": True, "项目": "编程费", "计价方式": "整批一次性费用", "金额": 200}], [])
-        self.assertAlmostEqual(result["batch_price"], result["unit_price"]*10 + 300, places=2)
+        # 单件报价已经含整批一次性费用的分摊，不能再次加 300。
+        self.assertAlmostEqual(result["batch_price"], result["unit_price"]*10, places=2)
+        self.assertAlmostEqual(result["one_time_cost"], 300, places=2)
+
+    def test_batch_pair_and_tapping_calculation(self):
+        rows = [
+            {"工序": "首件找正", "计算类型": "每批一次", "推荐设备": "CNC加工中心", "单件时间(h)": 0, "每批时间(h)": 0.4, "用户确认": True},
+            {"工序": "单件上下料", "计算类型": "每件", "推荐设备": "CNC加工中心", "单件时间(h)": 0.1, "用户确认": True},
+            {"工序": "两件配对磨削", "计算类型": "每对产品", "推荐设备": "磨床", "单件时间(h)": 0.4, "每批时间(h)": 0.8, "用户确认": True},
+            {"工序": "M4 螺纹加工", "计算类型": "每件", "推荐设备": "CNC加工中心", "数量": 36, "单件时间(h)": 0.012, "攻牙方式": "混合攻牙", "设备攻牙数量": 30, "人工攻牙数量": 6, "人工单孔时间(h)": 0.03, "用户确认": True},
+        ]
+        data = {"quantity": 3, "material": "灰铁", "net_weight": 1, "casting_weight": 1.2, "quote_mode": "成本加利润", "packaging_mode": "单件费用"}
+        result = calculate_quote(data, rows, DEFAULT_CONFIG, [], [])
+        schedules = {x["工序"]: x for x in result["operation_schedules"]}
+        self.assertAlmostEqual(schedules["首件找正"]["整批设备时间(h)"], 0.4)
+        self.assertAlmostEqual(schedules["两件配对磨削"]["整批设备时间(h)"], 1.6)
+        self.assertAlmostEqual(schedules["M4 螺纹加工"]["整批设备时间(h)"], 1.08)
+        self.assertAlmostEqual(schedules["M4 螺纹加工"]["整批人工时间(h)"], 0.54)
+        self.assertTrue(result["pair_warning"])
 
 
 if __name__ == "__main__":
