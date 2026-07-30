@@ -1,6 +1,7 @@
 import unittest
 
 from config import DEFAULT_CONFIG
+from export import quote_excel
 from machining_estimator import estimate_operations
 from pricing import calculate_quote
 
@@ -60,9 +61,22 @@ class RegressionTests(unittest.TestCase):
         schedules = {x["工序"]: x for x in result["operation_schedules"]}
         self.assertAlmostEqual(schedules["首件找正"]["整批设备时间(h)"], 0.4)
         self.assertAlmostEqual(schedules["两件配对磨削"]["整批设备时间(h)"], 1.6)
-        self.assertAlmostEqual(schedules["M4 螺纹加工"]["整批设备时间(h)"], 1.08)
-        self.assertAlmostEqual(schedules["M4 螺纹加工"]["整批人工时间(h)"], 0.54)
+        self.assertEqual(schedules["M4 螺纹加工（设备刚性攻牙）"]["设备"], "CNC加工中心")
+        self.assertEqual(schedules["M4 螺纹加工（人工攻牙）"]["设备"], "人工工位")
+        self.assertAlmostEqual(schedules["M4 螺纹加工（设备刚性攻牙）"]["整批设备时间(h)"], 1.08)
+        self.assertAlmostEqual(schedules["M4 螺纹加工（人工攻牙）"]["整批人工时间(h)"], 0.54)
         self.assertTrue(result["pair_warning"])
+
+    def test_100_piece_one_time_fee_is_not_multiplied(self):
+        rows = [{"工序": "纯切削", "计算类型": "每件", "推荐设备": "CNC加工中心", "单件时间(h)": 1, "用户确认": True}]
+        data = {"quantity": 100, "sample_quantity": 1, "tier_rows": [{"数量": 100, "批量效率系数": 0.93}],
+                "material": "灰铁", "net_weight": 1, "casting_weight": 1.2, "quote_mode": "成本加利润", "packaging_mode": "单件费用"}
+        result = calculate_quote(data, rows, DEFAULT_CONFIG, [{"启用": True, "项目": "首件检测费", "计价方式": "整批一次性费用", "金额": 243}], [])
+        self.assertAlmostEqual(result["additional_one_time_cost"], 243)
+        self.assertAlmostEqual(result["one_time_per_unit"], 2.43)
+        self.assertAlmostEqual(result["batch_cost"], result["repeated_per_unit_cost"] * 100 + 243)
+        self.assertGreater(result["sample_unit_price"], result["unit_price"])
+        self.assertGreater(len(quote_excel(data, result, DEFAULT_CONFIG)), 1000)
 
 
 if __name__ == "__main__":
