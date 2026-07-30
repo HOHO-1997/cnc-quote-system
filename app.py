@@ -17,11 +17,10 @@ ADDITIONAL_ITEMS = ["退火", "人工时效", "去应力处理", "水压测试",
 
 def init_state() -> None:
     st.session_state.setdefault("analysis_rows", [])
+    st.session_state.setdefault("confirmed_operations", [])
     st.session_state.setdefault("drawing", {})
     st.session_state.setdefault("step", {})
-    st.session_state.setdefault("tier_rows", [{"数量": 1, "批量效率系数": 1.00}, {"数量": 5, "批量效率系数": 1.00},
-                                               {"数量": 10, "批量效率系数": 0.98}, {"数量": 50, "批量效率系数": 0.95},
-                                               {"数量": 100, "批量效率系数": 0.93}])
+    st.session_state.setdefault("tier_rows", [{"数量": 1}, {"数量": 5}, {"数量": 10}, {"数量": 50}, {"数量": 100}])
 
 
 def _surface_rows(config: dict) -> list[dict]:
@@ -59,7 +58,7 @@ def drawing_and_step_panel(config: dict) -> None:
             st.session_state["step"] = step
             if step.get("available"):
                 estimate = estimate_operations(step, st.session_state.get("drawing", {}), config)
-                st.session_state["estimate"] = estimate; st.session_state["analysis_rows"] = estimate["rows"]
+                st.session_state["estimate"] = estimate; st.session_state["analysis_rows"] = estimate["rows"]; st.session_state["confirmed_operations"] = []
                 st.success("已生成自动识别结果，请在下方确认后带入报价。")
             else: st.warning(step.get("message"))
     drawing, step = st.session_state.get("drawing", {}), st.session_state.get("step", {})
@@ -68,6 +67,39 @@ def drawing_and_step_panel(config: dict) -> None:
     if step.get("available"):
         dims = step["dimensions"]
         st.info(f"STEP 成品净重 {step['net_weight']:.2f} kg；外形 {dims[0]:.0f} × {dims[1]:.0f} × {dims[2]:.0f} mm；最大平面 {step['largest_planar_area_m2']:.3f} m²。")
+
+
+def _normalize_and_validate_operations(rows: list[dict]) -> tuple[list[dict], list[str]]:
+    """确认后的工序唯一写入 confirmed_operations，并把攻牙数量规范化。"""
+    normalized, errors = [], []
+    for index, raw in enumerate(rows, start=1):
+        row = dict(raw)
+        process = str(row.get("工序", ""))
+        if "螺纹加工" not in process:
+            normalized.append(row)
+            continue
+        total = max(0, int(float(row.get("数量", 0) or 0)))
+        mode = row.get("攻牙方式", "待确认")
+        original_machine = row.get("攻牙设备") or row.get("推荐设备", "CNC加工中心")
+        row["攻牙设备"] = original_machine
+        if mode == "设备刚性攻牙":
+            row["设备攻牙数量"], row["人工攻牙数量"], row["推荐设备"] = total, 0, original_machine
+        elif mode == "人工攻牙":
+            row["设备攻牙数量"], row["人工攻牙数量"], row["推荐设备"] = 0, total, "人工工位"
+        elif mode == "无螺纹加工":
+            row["设备攻牙数量"], row["人工攻牙数量"] = 0, 0
+        elif mode == "混合攻牙":
+            device = int(float(row.get("设备攻牙数量", 0) or 0)); manual = int(float(row.get("人工攻牙数量", 0) or 0))
+            if device + manual != total:
+                errors.append(f"第 {index} 行 {process}：设备攻牙数量与人工攻牙数量之和必须等于 {total}。")
+            if device < 0 or manual < 0:
+                errors.append(f"第 {index} 行 {process}：攻牙数量不能为负数。")
+        else:
+            errors.append(f"第 {index} 行 {process}：请选择攻牙方式。")
+        if mode == "人工攻牙" and (total <= 0 or float(row.get("人工单孔时间(h)", 0) or 0) <= 0):
+            errors.append(f"第 {index} 行 {process}：人工攻牙数量和单孔时间必须大于 0。")
+        normalized.append(row)
+    return normalized, errors
 
 
 def confirmation_panel(config: dict) -> None:
@@ -87,16 +119,25 @@ def confirmation_panel(config: dict) -> None:
                                                  "判断依据": "人工录入", "置信度": "人工", "类型": "基础", "用户确认": False}]
     edited = st.data_editor(pd.DataFrame(st.session_state["analysis_rows"]), use_container_width=True, hide_index=True,
                             num_rows="dynamic", column_config={
-                                "推荐设备": st.column_config.SelectboxColumn(options=list(config["machine_rates"])),
+                                "推荐设备": st.column_config.SelectboxColumn(options=[*list(config["machine_rates"]), "人工工位"]),
                                 "计算类型": st.column_config.SelectboxColumn(options=["每件", "每批一次", "每对产品", "手动总价"]),
                                 "攻牙方式": st.column_config.SelectboxColumn(options=["待确认", "无螺纹加工", "设备刚性攻牙", "人工攻牙", "混合攻牙"]),
                                 "用户确认": st.column_config.CheckboxColumn()}, key="operation_editor")
+    # 编辑后但尚未确认时，旧报价立即作废，避免用户误把修改前的攻牙方式拿去报价。
+    if st.session_state.get("confirmed_operations") and edited.to_dict("records") != st.session_state["confirmed_operations"]:
+        st.session_state.pop("quote", None)
+        st.info("工序表已修改，请点击“确认带入报价”后重新计算。")
     if st.button("确认带入报价", type="primary"):
-        st.session_state["analysis_rows"] = edited.to_dict("records")
+        normalized, errors = _normalize_and_validate_operations(edited.to_dict("records"))
+        if errors:
+            for error in errors: st.error(error)
+            st.stop()
+        # 这是报价的唯一数据源。后续重新计算不再读取自动推荐的 analysis_rows。
+        st.session_state["analysis_rows"] = normalized
+        st.session_state["confirmed_operations"] = normalized
         st.session_state["operations_confirmed"] = True
-        unresolved = edited[(edited["工序"].astype(str).str.contains("螺纹加工")) & (edited["攻牙方式"] == "待确认")]
-        if not unresolved.empty: st.warning("存在待确认的螺纹组，未计入报价；请选择设备刚性攻牙、人工攻牙或混合攻牙后再确认。")
-        st.success("确认完成。可在下方计算报价。")
+        st.session_state.pop("quote", None)
+        st.success("确认完成，已更新报价数据源。请在下方重新计算报价。")
 
 
 def pricing_page(config: dict) -> None:
@@ -130,13 +171,15 @@ def pricing_page(config: dict) -> None:
         st.subheader("其他成本项目")
         additional = st.data_editor(pd.DataFrame(_additional_rows(drawing)), use_container_width=True, hide_index=True, key="additional_editor")
         st.subheader("阶梯批量报价")
-        st.caption("效率系数只降低每件上下料、夹紧、换刀、测量、倒角和去毛刺等辅助时间；材料、纯切削、钻孔和攻牙不降低。")
-        tier_editor = st.data_editor(pd.DataFrame(st.session_state["tier_rows"]), use_container_width=True, hide_index=True, num_rows="dynamic", key="tier_editor")
+        st.caption("折扣由参数设置中的数量范围自动匹配，只作用于客户报价中的每件加工费；不改变真实工时，也不降低材料、表处或一次性费用。")
+        tier_editor = st.data_editor(pd.DataFrame([{"数量": row.get("数量", 1)} for row in st.session_state["tier_rows"]]), use_container_width=True, hide_index=True, num_rows="dynamic", key="tier_editor")
         submitted = st.form_submit_button("计算报价", type="primary")
     if submitted:
         if not customer or not product_name: st.error("请填写客户名称和产品名称。"); return
-        rows = st.session_state.get("analysis_rows", [])
-        if not rows: st.warning("尚未确认自动工序，请手动新增工序或先分析 STEP/PDF。")
+        rows = st.session_state.get("confirmed_operations", [])
+        if not rows:
+            st.warning("请先在“自动识别结果确认表”点击“确认带入报价”。报价只读取已确认工序。")
+            return
         data = {"customer": customer, "product_name": product_name, "product_number": product_number, "quantity": quantity, "product_type": product_type,
                 "fixture_count": fixture_count, "sample_quantity": sample_quantity, "tier_rows": tier_editor.to_dict("records"), "material": material, "net_weight": net_weight, "casting_weight": casting_weight, "quote_mode": quote_mode,
                 "casting_sales_rate": sale_rate, "packaging_mode": packaging_mode, "packaging_cost": packaging_cost, "surface_area_m2": step.get("total_planar_area_m2", 0.0), "surfaces": surfaces.to_dict("records")}
@@ -157,17 +200,20 @@ def pricing_page(config: dict) -> None:
         ("批量平均单件成本", result["unit_cost"], "含一次性费用分摊"),
     ]): col.metric(label, f"¥ {value:,.2f}", note)
     st.subheader("单件成本组成")
-    for col, (label, value) in zip(st.columns(4), [
-        ("单件材料成本", result["casting_per_unit"]), ("单件设备加工费", result["equipment_per_unit"]),
-        ("单件人工成本", result["labor_per_unit"]), ("单件表面处理、包装及其他", result["surface_per_unit"] + result["packaging_per_unit"]),
+    for col, (label, value) in zip(st.columns(5), [
+        ("单件材料成本", result["casting_per_unit"]), ("原单件加工费", result["raw_processing_per_unit"]),
+        ("优惠后单件加工费", result["discounted_processing_per_unit"]), ("单件人工攻牙费", result["tapping_labor_per_unit"]),
+        ("单件表面处理、包装及其他", result["surface_per_unit"] + result["packaging_per_unit"]),
     ]): col.metric(label, f"¥ {value:,.2f}")
+    st.info(f"本批 {data['quantity']} 件加工费折扣：{result['processing_discount']:.0%}；原单件加工费 ¥{result['raw_processing_per_unit']:.2f} → 优惠后 ¥{result['discounted_processing_per_unit']:.2f}；一次性费用 ¥{result['one_time_cost']:.2f}，单件分摊 ¥{result['one_time_per_unit']:.2f}。")
     with st.expander("工时与设备占机摘要", expanded=False):
         for col, (label, value) in zip(st.columns(5), [
             ("单件纯切削时间", result["pure_cutting_time"]), ("单件上下料时间", result["loading_time"]),
             ("每批一次性准备", result["batch_preparation_time"]),
-            ("单件人工时间", result["labor_per_unit"] / max(1, config.get("manual_labor_rate", 35.0))),
+            ("单件人工工时", result["labor_per_unit"] / max(1, config.get("manual_labor_rate", 35.0))),
             ("整批设备总时间", result["batch_equipment_time"]),
         ]): col.metric(label, f"{value:.2f} h")
+        st.caption(f"其中单件人工攻牙：{result['tapping_labor_hours_per_unit']:.2f} h；整批人工攻牙：{result['tapping_labor_hours_per_unit'] * data['quantity']:.2f} h。")
     if result.get("pair_warning"):
         st.warning("本批数量为奇数，存在按对产品工序；最后一件没有匹配件，不能承诺成对等高交付。")
     st.subheader("一次性费用（整批仅计算一次）")
@@ -230,6 +276,8 @@ def settings_page(config: dict) -> None:
             cap = config.get("machine_capabilities", {}).get(name, {})
             machine_rows.append({"设备": name, "成本价/h": rate, "直接报价/h": config.get("direct_machine_rates", {}).get(name, rate), "X": cap.get("x", 0), "Y": cap.get("y", 0), "Z": cap.get("z", 0), "承重": cap.get("max_weight", 0), "侧铣头": cap.get("side_head", False), "五面加工": cap.get("five_axis", False)})
         machine_editor = st.data_editor(pd.DataFrame(machine_rows), hide_index=True, use_container_width=True)
+        st.subheader("批量加工费折扣（仅影响客户报价，不改变实际工时）")
+        discount_editor = st.data_editor(pd.DataFrame(config.get("batch_processing_discounts", [])), hide_index=True, use_container_width=True, num_rows="dynamic")
         st.subheader("表面处理参数")
         surface_rows = [{"名称": name, "默认单价": item.get("rate", 0.0), "默认计价方式": item.get("basis", "按kg"), "最低收费": item.get("minimum", 0.0)} for name, item in config["surface_treatments"].items()]
         surface_editor = st.data_editor(pd.DataFrame(surface_rows), hide_index=True, use_container_width=True, num_rows="dynamic")
@@ -239,6 +287,7 @@ def settings_page(config: dict) -> None:
                 n = row["材料"]; config["materials"][n] = float(row["成本价"]); config["casting_sales_prices"][n] = float(row["销售价"]); config["densities"][n] = float(row["密度"]); config["casting_blank_factors"][n] = float(row["毛坯系数"])
             for row in machine_editor.to_dict("records"):
                 n = row["设备"]; config["machine_rates"][n] = float(row["成本价/h"]); config["direct_machine_rates"][n] = float(row["直接报价/h"]); config.setdefault("machine_capabilities", {})[n] = {"x": float(row["X"]), "y": float(row["Y"]), "z": float(row["Z"]), "max_weight": float(row["承重"]), "side_head": bool(row["侧铣头"]), "five_axis": bool(row["五面加工"]), "table_x": float(row["X"]), "table_y": float(row["Y"])}
+            config["batch_processing_discounts"] = discount_editor.to_dict("records")
             config["surface_treatments"] = {row["名称"]: {"rate": float(row["默认单价"]), "basis": row["默认计价方式"], "minimum": float(row["最低收费"])} for row in surface_editor.to_dict("records") if str(row["名称"]).strip()}
             save_config(config); st.success("参数已保存。")
 
