@@ -90,6 +90,11 @@ def analyze_drawing(text: str) -> dict:
     threads = re.findall(r"(?:\d+\s*[×xX-]\s*)?M\s*(\d+)(?:\s*[×xX]\s*([0-9.]+))?", text, flags=re.IGNORECASE)
     thread_groups = re.findall(r"(?m)(\d+)\s*[×xX-]\s*M\s*\d+", text, flags=re.IGNORECASE)
     threaded_count = sum(int(x) for x in thread_groups) or len(threads)
+    detailed_thread_groups = []
+    for match in re.finditer(r"(?:(\d+)\s*[×xX-]\s*)?M\s*(\d+)(?:\s*[×xX]\s*([0-9.]+))?", text, flags=re.IGNORECASE):
+        count = int(match.group(1) or 1)
+        diameter = int(match.group(2)); pitch = match.group(3) or ""
+        detailed_thread_groups.append({"规格": f"M{diameter}" + (f"×{pitch}" if pitch else ""), "数量": count, "直径": diameter})
     holes = re.findall(r"(?m)(\d+)\s*[×xX-]\s*[ΦØ]\s*([0-9]+(?:\.[0-9]+)?)(?:\s*[深深]\s*([0-9.]+))?", text)
     drilled_count = sum(int(count) for count, _, _ in holes)
     hole_features = [{"count": int(c), "diameter": float(d), "depth": float(depth) if depth else None} for c, d, depth in holes]
@@ -109,7 +114,7 @@ def analyze_drawing(text: str) -> dict:
     if pair_height:
         extra_sources.append({"source": "两件/成对等高交付", "hours": 0.50, "recommended_equipment": "磨床", "confidence": "高"})
     return {"text_available": bool(text.strip()), "min_tolerance": min_tolerance, "geometric_values": geometric_values,
-            "gd_terms": gd_terms, "roughness": roughness, "threads": threads, "thread_diameters": diameters,
+            "gd_terms": gd_terms, "roughness": roughness, "threads": threads, "thread_diameters": diameters, "thread_groups": detailed_thread_groups,
             "threaded_count": threaded_count, "hole_features": hole_features, "drilled_count": drilled_count,
             "pair_height_requirement": pair_height, "explicit_grinding": explicit_grinding, "requires_turning": requires_turning,
             "heat_treatments": heat_treatments, "surface_processes": surface_processes, "tests": tests,

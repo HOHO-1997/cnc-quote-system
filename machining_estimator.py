@@ -4,8 +4,12 @@ from __future__ import annotations
 from step_analyzer import turning_geometry_confidence
 
 
-def _row(process: str, equipment: str, hours: float, basis: str, confidence: str, kind: str = "基础", confirmed: bool = True) -> dict:
-    return {"工序": process, "推荐设备": equipment, "推荐时间(h)": round(max(0.0, hours), 2), "判断依据": basis,
+def _row(process: str, equipment: str, hours: float, basis: str, confidence: str, kind: str = "基础", confirmed: bool = True,
+         calculation_type: str = "每件", count: int = 1, batch_hours: float = 0.0, tapping_mode: str = "无螺纹加工") -> dict:
+    return {"工序": process, "计算类型": calculation_type, "推荐设备": equipment, "数量": count,
+            "单件时间(h)": round(max(0.0, hours), 3), "每批时间(h)": round(max(0.0, batch_hours), 3),
+            "推荐时间(h)": round(max(0.0, hours), 3), "攻牙方式": tapping_mode, "设备攻牙数量": 0, "人工攻牙数量": 0,
+            "人工单孔时间(h)": 0.03, "手动总价(元)": 0.0, "判断依据": basis,
             "置信度": confidence, "类型": kind, "用户确认": confirmed}
 
 
@@ -90,7 +94,8 @@ def estimate_operations(step: dict, drawing: dict, config: dict, product_type: s
     grinding_reason = "未建议磨床"
     if drawing.get("pair_height_requirement"):
         pair_time = max(0.6, 0.55 + max_plane*2.0 + (0.2 if drawing.get("min_tolerance") and drawing["min_tolerance"] <= 0.01 else 0))
-        rows.append(_row("两件配对磨削（按单件分摊）", "磨床", pair_time/2, f"每对约 {pair_time:.1f} h；两件等高交付", "高", "基础", True))
+        rows.append(_row("两件配对磨削", "磨床", pair_time/2, f"每对约 {pair_time:.1f} h；两件等高交付", "高", "基础", True,
+                         calculation_type="每对产品", count=2, batch_hours=pair_time))
         grinding_reason = f"两件等高：每对磨削 {pair_time:.1f} h，单件分摊 {pair_time/2:.2f} h"
     elif drawing.get("explicit_grinding") or (flat_high and 150 <= max_dim <= 800) or (drawing.get("roughness") and min(drawing["roughness"]) <= 0.8):
         if _fits(step, _capability(config, "磨床")):
@@ -99,5 +104,28 @@ def estimate_operations(step: dict, drawing: dict, config: dict, product_type: s
             grinding_reason = "关键平面精度超出常规精铣稳定能力，建议磨床"
         else:
             grinding_reason = "存在高精度磨削信号，但尺寸/承重可能超过普通磨床；需人工确认精密龙门或外协大型磨床"
+    # 首件找正与每件上下料分开，防止首次工作被重复乘数量。
+    loading_rows = []
+    for row in rows:
+        # 仅拆分纯“装夹找正”工序；车床首装那一行还含端面/内孔/螺纹切削，不能整行误算为一次性准备。
+        if "装夹找正" in row["工序"] and "上下料" not in row["工序"]:
+            first_hours = row["单件时间(h)"]
+            row["工序"] = "首件夹具安装及找正"
+            row["计算类型"], row["每批时间(h)"], row["单件时间(h)"], row["推荐时间(h)"] = "每批一次", first_hours, 0.0, 0.0
+            load_hours = 0.25 if primary == "龙门铣" else 0.10
+            loading_rows.append(_row("单件上下料、夹紧与定位面清理", primary, load_hours, "每件重复上料、夹紧、简单找正和下料", "中"))
+        if "攻牙" in row["工序"]:
+            row["工序"], row["单件时间(h)"], row["推荐时间(h)"] = "倒角", 0.08, 0.08
+            loading_rows.append(_row("机内测量", row["推荐设备"], 0.07, "关键尺寸机内复测", "中"))
+            loading_rows.append(_row("下机检验与去毛刺", "人工", 0.10, "下机外观、尺寸与去毛刺", "中"))
+    rows.extend(loading_rows)
+    rows.insert(0, _row("CNC编程、首件工艺准备与试切", primary, 0.0, "编程、首件对刀、试切和程序验证", "中", "基础", True,
+                        calculation_type="每批一次", batch_hours=programming))
+    # 螺纹组必须确认攻牙方式；待确认行默认不进入报价。
+    for group in drawing.get("thread_groups", []):
+        diameter, count = group["直径"], group["数量"]
+        device_time = 0.012 if diameter <= 6 else (0.018 if diameter <= 12 else 0.030)
+        rows.append(_row(f"{group['规格']} 螺纹加工", primary, device_time, f"图纸识别 {group['规格']}，共 {count} 个；请确认攻牙方式", "中", "基础", False,
+                         calculation_type="每件", count=count, tapping_mode="待确认"))
     return {"rows": rows, "classification": classification, "evidence": evidence, "programming_hours": programming,
             "fixture_hours": fixture, "grinding_assessment": grinding_reason, "turning_geometry_confidence": geometry_turn_conf}

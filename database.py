@@ -29,13 +29,18 @@ def init_database() -> None:
 
 
 def save_quote(data: dict, result: dict, config: dict) -> None:
-    hours = {row["推荐设备"]: 0.0 for row in result["confirmed_rows"]}
-    for row in result["confirmed_rows"]: hours[row["推荐设备"]] = hours.get(row["推荐设备"], 0) + float(row["推荐时间(h)"])
+    # 历史库保存“单件平均预测工时”。整批一次性准备和成对工序先按本批数量分摊，
+    # 这样实际工时录入后才能与同一口径的预测工时比较。
+    quantity = max(1, int(data.get("quantity", 1)))
+    hours: dict[str, float] = {}
+    for item in result.get("operation_schedules", []):
+        equipment = item.get("设备", "")
+        hours[equipment] = hours.get(equipment, 0.0) + float(item.get("整批设备时间(h)", 0.0)) / quantity
     values = {"quote_date": datetime.now().strftime("%Y-%m-%d %H:%M"), "customer": data.get("customer", ""), "product_name": data.get("product_name", ""),
               "product_number": data.get("product_number", ""), "quantity": data.get("quantity", 1), "material": data.get("material", ""), "weight": data.get("net_weight", 0),
               "cnc_hours": sum(hours.values()), "surface_treatment": json.dumps(data.get("surfaces", []), ensure_ascii=False), "packaging_cost": data.get("packaging_cost", 0),
               "material_cost": result["casting_per_unit"], "cnc_cost": result["equipment_per_unit"], "surface_cost": result["surface_per_unit"], "total_cost": result["unit_cost"],
-              "profit_multiplier": config.get("profit_multiplier", 1.2), "final_price": result["unit_price"], "cnc_details": json.dumps(result["confirmed_rows"], ensure_ascii=False),
+              "profit_multiplier": config.get("profit_multiplier", 1.2), "final_price": result["unit_price"], "cnc_details": json.dumps(result.get("operation_schedules", []), ensure_ascii=False),
               "quote_mode": result["quote_mode"], "unit_cost": result["unit_cost"], "unit_price": result["unit_price"], "batch_cost": result["batch_cost"], "batch_price": result["batch_price"],
               "one_time_cost": result["one_time_cost"], "product_type": data.get("product_type", "自动识别"), "fixture_count": data.get("fixture_count", 0),
               "predicted_cnc": hours.get("CNC加工中心", 0), "predicted_lathe": hours.get("车床", 0), "predicted_gantry": hours.get("龙门铣", 0), "predicted_grinding": hours.get("磨床", 0)}
