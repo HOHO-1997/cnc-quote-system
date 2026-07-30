@@ -30,9 +30,16 @@ def estimate_operations(step: dict, drawing: dict, config: dict, product_type: s
     holes = drawing.get("hole_features", []); threads = drawing.get("threaded_count", 0)
     geometry_turn_conf, turn_evidence = turning_geometry_confidence(step)
     drawing_turn = drawing.get("requires_turning", False)
+    thread_diameters = drawing.get("thread_diameters", [])
+    large_thread = any(float(value) >= 40 for value in thread_diameters)
+    rotating_type = product_type in {"小型阀体", "阀体", "泵体", "回转体", "车削件"}
+    drawing_turn = drawing_turn or large_thread or rotating_type
     small_valve = max_dim <= 250 and weight <= 10 and drawing_turn
     large_frame = max_dim >= 1500 and weight >= 500
-    multi_side = drawing.get("drilled_count", 0) >= 8 and any(term in drawing.get("gd_terms", []) for term in ["位置度", "同轴度"])
+    multi_side = bool(drawing.get("side_feature_count", 0) >= 3 and (
+        drawing.get("cross_wall_coaxial") or drawing.get("horizontal_deep_holes") or
+        any(term in drawing.get("gd_terms", []) for term in ["位置度", "同轴度"])
+    ))
     cnc_fit = _fits(step, _capability(config, "CNC加工中心"))
     hmc_fit = _fits(step, _capability(config, "卧式加工中心"))
     gantry_fit = _fits(step, _capability(config, "龙门铣"))
@@ -65,7 +72,7 @@ def estimate_operations(step: dict, drawing: dict, config: dict, product_type: s
     else:
         if not cnc_fit and gantry_fit:
             classification, primary = "大型铣削件", "龙门铣"; evidence.append("超过普通 CNC 行程或承重")
-        elif hmc_fit and (multi_side or (max_dim > 800 and not gantry_fit)):
+        elif hmc_fit and (multi_side or product_type == "箱体/多方向孔系"):
             classification, primary = "箱体/多方向孔系", "卧式加工中心"; evidence.append("多侧孔/镗孔和位置度，同一装夹有优势")
         else:
             classification, primary = "通用铸件/机加工件", "CNC加工中心"; evidence.append("尺寸与重量在普通 CNC 能力范围")
@@ -83,7 +90,7 @@ def estimate_operations(step: dict, drawing: dict, config: dict, product_type: s
                 _row("设备刚性攻牙、倒角和测量", primary, tap_time + 0.15, "螺纹数量与辅助时间", "中")]
         programming, fixture = 2.0, 0.0
         # 只有强的同轴回转证据加车床；局部侧孔不触发。
-        if drawing_turn and geometry_turn_conf >= 0.55:
+        if drawing_turn and (geometry_turn_conf >= 0.45 or large_thread or rotating_type):
             rows.append(_row("车削同轴孔/外圆/槽", "车床", 0.6, turn_evidence, "中"))
     # 图纸追加项默认不确认，避免悄悄进入报价。
     for source in drawing.get("extra_sources", []):

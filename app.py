@@ -33,7 +33,7 @@ def _additional_rows(drawing: dict) -> list[dict]:
     return [{"启用": item in detected, "项目": item, "计价方式": "按重量" if item in {"退火", "人工时效", "去应力处理"} else "整批一次性费用", "金额": 2.0 if item == "退火" else 0.0} for item in ADDITIONAL_ITEMS]
 
 
-def drawing_and_step_panel(config: dict) -> None:
+def drawing_and_step_panel(config: dict, product_type: str = "自动识别") -> None:
     with st.expander("图纸与模型分析（先读取 PDF/DXF，再分析 STEP）", expanded=True):
         col1, col2 = st.columns(2)
         with col1: pdf = st.file_uploader("PDF 图纸", type=["pdf"])
@@ -57,7 +57,7 @@ def drawing_and_step_panel(config: dict) -> None:
             step = analyze_step(step_file.getvalue(), material, config)
             st.session_state["step"] = step
             if step.get("available"):
-                estimate = estimate_operations(step, st.session_state.get("drawing", {}), config)
+                estimate = estimate_operations(step, st.session_state.get("drawing", {}), config, product_type=product_type)
                 st.session_state["estimate"] = estimate; st.session_state["analysis_rows"] = estimate["rows"]; st.session_state["confirmed_operations"] = []
                 # 新图纸/模型必须丢弃旧 data_editor 缓存，否则可能把上一张图的局部行带入本次确认。
                 st.session_state.pop("operation_editor", None)
@@ -70,6 +70,14 @@ def drawing_and_step_panel(config: dict) -> None:
     if step.get("available"):
         dims = step["dimensions"]
         st.info(f"STEP 成品净重 {step['net_weight']:.2f} kg；外形 {dims[0]:.0f} × {dims[1]:.0f} × {dims[2]:.0f} mm；最大平面 {step['largest_planar_area_m2']:.3f} m²。")
+        if st.button("按当前产品类型重新生成工序"):
+            estimate = estimate_operations(step, drawing, config, product_type=product_type)
+            st.session_state["estimate"] = estimate
+            st.session_state["analysis_rows"] = estimate["rows"]
+            st.session_state["confirmed_operations"] = []
+            st.session_state.pop("operation_editor", None)
+            st.session_state.pop("quote", None)
+            st.success("已按当前产品类型重新生成工序，请在确认表复核后带入报价。")
 
 
 def _normalize_and_validate_operations(rows: list[dict]) -> tuple[list[dict], list[str]]:
@@ -174,7 +182,8 @@ def confirmation_panel(config: dict) -> None:
 
 def pricing_page(config: dict) -> None:
     st.header("新建报价")
-    drawing_and_step_panel(config); confirmation_panel(config)
+    selected_product_type = st.selectbox("产品类型（用于设备推荐与生成工序）", ["自动识别", "大型机架/床身", "箱体/多方向孔系", "横梁支架", "小型阀体", "阀体", "泵体", "回转体", "车削件", "其他"], key="analysis_product_type")
+    drawing_and_step_panel(config, selected_product_type); confirmation_panel(config)
     fields = st.session_state.get("fields", {}); step = st.session_state.get("step", {}); drawing = st.session_state.get("drawing", {})
     default_material = fields.get("material", "灰铁")
     net_default = step.get("net_weight", fields.get("weight", 0.0))
@@ -188,7 +197,8 @@ def pricing_page(config: dict) -> None:
         with b:
             quantity = st.number_input("数量（单件参数按此数量汇总）", min_value=1, value=int(fields.get("quantity", 1)), step=1)
             sample_quantity = st.number_input("打样数量", min_value=1, value=1, step=1, help="打样单价会把全部一次性费用按此数量分摊。")
-            product_type = st.selectbox("产品类型", ["自动识别", "大型机架/床身", "箱体/多方向孔系", "横梁支架", "小型阀体", "其他"])
+            product_type = selected_product_type
+            st.caption(f"当前产品类型：{product_type}（如需改变设备推荐，请在图纸分析前修改）")
             fixture_count = st.number_input("装夹次数（复核用）", min_value=0, value=0, step=1)
         with c:
             material = st.selectbox("材料", list(config["materials"]), index=list(config["materials"]).index(default_material) if default_material in config["materials"] else 0)

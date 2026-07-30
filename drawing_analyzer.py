@@ -119,3 +119,101 @@ def analyze_drawing(text: str) -> dict:
             "pair_height_requirement": pair_height, "explicit_grinding": explicit_grinding, "requires_turning": requires_turning,
             "heat_treatments": heat_treatments, "surface_processes": surface_processes, "tests": tests,
             "extra_sources": extra_sources}
+
+
+# 以下为新版工程标注解析。保留旧函数以兼容旧引用，但运行时使用本定义。
+def normalize_engineering_text(text: str) -> str:
+    """逐行恢复 OCR/PDF 拆开的工程标注，绝不把不同图框行拼在一起。"""
+    lines = []
+    for raw in text.splitlines():
+        line = raw.replace("＊", "×").replace("X", "×").replace("x", "×")
+        line = re.sub(r"(?<=\d)\s*\.\s*(?=\d)", ".", line)
+        # PDF/OCR 常把小数末位和公差等级拆开，如 7 . 1 0、6 H。
+        line = re.sub(r"(\d+\.\d)\s+(\d)\b", r"\1\2", line)
+        line = re.sub(r"(\d)\s+([HhGg])\b", r"\1\2", line)
+        line = re.sub(r"([+\-])\s*(\d)", r"\1\2", line)
+        line = re.sub(r"(?<=M)\s*(\d(?:\s*\d)*)", lambda m: "".join(m.group(1).split()), line, flags=re.I)
+        line = re.sub(r"([ØΦφ])\s*(\d(?:\s*\d)*)", lambda m: "Ø" + "".join(m.group(2).split()), line)
+        line = re.sub(r"\s*×\s*", "×", line)
+        line = re.sub(r"\s*([-+/])\s*", r"\1", line)
+        line = re.sub(r"\s+", " ", line).strip()
+        if line:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def _feature_count(match: re.Match) -> int:
+    return int(match.group("count") or 1)
+
+
+def _valid_tolerance(value: float) -> bool:
+    return 0.001 <= abs(value) <= 10.0
+
+
+def analyze_drawing(text: str) -> dict:
+    engineering = normalize_engineering_text(text)
+    upper = engineering.upper()
+    thread_features, hole_features = [], []
+    # 螺纹必须以 M + 数字开头；不会从 Ø7.1、Ø2.4、局部视图 M 或比例 2:1 推导。
+    thread_re = re.compile(r"(?:(?P<count>\d+)\s*[-×]\s*)?M(?P<dia>\d+(?:\.\d+)?)(?:×(?P<pitch>\d+(?:\.\d+)?))?(?:-(?P<class>\d[HGhg]))?(?:\s*(?:深|DEPTH)\s*(?P<depth>\d+(?:\.\d+)?))?", re.I)
+    for m in thread_re.finditer(engineering):
+        dia = float(m.group("dia")); count = _feature_count(m)
+        if not (1 <= dia <= 300) or m.group(0).upper().startswith("M:"):
+            continue
+        specification = f"M{m.group('dia')}" + (f"×{m.group('pitch')}" if m.group("pitch") else "")
+        if m.group("class"):
+            specification += "-" + m.group("class").upper()
+        thread_features.append({"specification": specification, "nominal_diameter": dia, "pitch": _number_or_none(m.group("pitch")),
+                                "tolerance_class": m.group("class").upper() if m.group("class") else None, "count": count,
+                                "depth": _number_or_none(m.group("depth")), "through": False, "source_text": m.group(0), "confidence": "高"})
+    # 孔必须以 Ø/Φ 开头；通/贯穿/THRU 与深/DEPTH 分别保存，不能视为螺纹。
+    hole_re = re.compile(r"(?:(?P<count>\d+)\s*[-×]\s*)?[ØΦφ](?P<dia>\d+(?:\.\d+)?)(?P<tol>\s*[+\-]\d+(?:\.\d+)?\s*/?\s*[+\-]?\d*(?:\.\d+)?)?(?P<tail>[^\n]{0,30})", re.I)
+    for m in hole_re.finditer(engineering):
+        tail = m.group("tail") or ""; count = _feature_count(m)
+        through = bool(re.search(r"通孔|贯穿|\bTHRU\b|\bTHROUGH\b|\b通\b", tail, re.I))
+        depth_m = re.search(r"(?:深|深度|DEPTH)\s*(\d+(?:\.\d+)?)", tail, re.I)
+        hole_features.append({"diameter": float(m.group("dia")), "count": count, "depth": _number_or_none(depth_m.group(1)) if depth_m else None,
+                              "through": through, "countersink": "沉头" in tail or "锪" in tail, "counterbore": "沉孔" in tail or "锪平" in tail,
+                              "reamed": "铰" in tail, "tolerance": (m.group("tol") or "").strip() or None,
+                              "source_text": m.group(0), "confidence": "高" if through or depth_m else "中"})
+    dimensional_tolerances = []
+    for m in re.finditer(r"(?:[ØΦφ]?\d+(?:\.\d+)?)\s*±\s*(\d+(?:\.\d+)?)", engineering):
+        value = float(m.group(1))
+        if _valid_tolerance(value): dimensional_tolerances.append({"kind": "对称", "value": value, "source_text": m.group(0), "confidence": "高"})
+    for m in re.finditer(r"(?:[ØΦφ]?\d+(?:\.\d+)?)\s*\+(\d+(?:\.\d+)?)\s*/\s*-(\d+(?:\.\d+)?)", engineering):
+        values = [float(m.group(1)), float(m.group(2))]
+        if all(_valid_tolerance(v) for v in values): dimensional_tolerances.append({"kind": "上下偏差", "upper": values[0], "lower": -values[1], "source_text": m.group(0), "confidence": "高"})
+    gd_names = ["平面度", "平行度", "垂直度", "同轴度", "同心度", "位置度", "圆度", "圆跳动", "全跳动"]
+    geometric_tolerances = []
+    for name in gd_names:
+        for m in re.finditer(re.escape(name) + r"[^\d\n]{0,16}(0?\.\d+)", engineering):
+            value = float(m.group(1))
+            if _valid_tolerance(value): geometric_tolerances.append({"kind": name, "value": value, "source_text": m.group(0), "confidence": "中"})
+    roughness = [float(v) for v in re.findall(r"\bRA\s*(\d+(?:\.\d+)?)|(?:其余|其它)\s*(\d+(?:\.\d+)?)", upper) for v in v if v]
+    min_tolerance = min([x["value"] for x in dimensional_tolerances if "value" in x] + [abs(x["upper"]) for x in dimensional_tolerances if "upper" in x] or [999])
+    min_tolerance = None if min_tolerance == 999 else min_tolerance
+    threaded_count = sum(x["count"] for x in thread_features)
+    drilled_count = sum(x["count"] for x in hole_features)
+    turning_terms = ["车削", "车床", "内孔", "外圆", "密封槽", "环槽", "同轴孔"]
+    requires_turning = any(x["nominal_diameter"] >= 40 for x in thread_features) or any(term in engineering for term in turning_terms)
+    pair_height = "等高" in engineering and any(v in engineering for v in ["两件", "2件", "成对", "配对"])
+    explicit_grinding = any(v in engineering for v in ["磨削", "配磨", "成对磨"])
+    heat_treatments = [name for name, keys in {"退火": ["退火", "回火"], "人工时效": ["人工时效"], "去应力处理": ["去应力", "应力消除"]}.items() if any(k in engineering for k in keys)]
+    surface_processes = [name for name in ["喷砂", "喷漆", "喷粉", "黑漆", "氧化", "电泳", "磷化"] if name in engineering]
+    tests = [name for name, keys in {"水压测试": ["水压", "压力测试"], "密封测试": ["密封测试", "气密"], "材质报告": ["材质报告", "材质证明"], "三坐标检测": ["三坐标", "CMM"]}.items() if any(k in engineering for k in keys)]
+    extra_sources = []
+    if min_tolerance is not None and min_tolerance <= 0.05:
+        extra_sources.append({"source": f"尺寸公差 ±{min_tolerance:.3f} mm", "hours": 0.20, "recommended_equipment": "CNC加工中心", "confidence": "中"})
+    if geometric_tolerances and min(x["value"] for x in geometric_tolerances) <= 0.01:
+        extra_sources.append({"source": f"形位精度 {min(x['value'] for x in geometric_tolerances):.3f} mm", "hours": 0.30, "recommended_equipment": "磨床", "confidence": "中"})
+    return {"text_available": bool(engineering.strip()), "normalized_text": engineering, "thread_features": thread_features, "hole_features": hole_features,
+            "threads": [(str(x["nominal_diameter"]), str(x["pitch"] or "")) for x in thread_features], "thread_diameters": [x["nominal_diameter"] for x in thread_features],
+            "thread_groups": [{"规格": x["specification"], "数量": x["count"], "直径": x["nominal_diameter"]} for x in thread_features], "threaded_count": threaded_count,
+            "drilled_count": drilled_count, "dimensional_tolerances": dimensional_tolerances, "geometric_tolerances": geometric_tolerances,
+            "geometric_values": [x["value"] for x in geometric_tolerances], "gd_terms": [x["kind"] for x in geometric_tolerances], "roughness": roughness,
+            "min_tolerance": min_tolerance, "pair_height_requirement": pair_height, "explicit_grinding": explicit_grinding, "requires_turning": requires_turning,
+            "heat_treatments": heat_treatments, "surface_processes": surface_processes, "tests": tests, "extra_sources": extra_sources}
+
+
+def _number_or_none(value: str | None) -> float | None:
+    return float(value) if value else None

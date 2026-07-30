@@ -6,6 +6,52 @@ import tempfile
 from pathlib import Path
 
 
+def _unit(vector: tuple[float, float, float]) -> tuple[float, float, float]:
+    length = math.sqrt(sum(item * item for item in vector))
+    return tuple(item / length for item in vector) if length else (0.0, 0.0, 1.0)
+
+
+def _canonical_axis(vector: tuple[float, float, float]) -> tuple[float, float, float]:
+    """同一根轴允许方向相反，统一成一个方向用于比较。"""
+    axis = _unit(vector)
+    for value in axis:
+        if abs(value) > 1e-8:
+            return axis if value > 0 else tuple(-item for item in axis)
+    return axis
+
+
+def _axis_distance(first: dict, second: dict) -> float:
+    """平行轴线最短垂距；轴线上起点不同不影响同轴判断。"""
+    direction = _canonical_axis(tuple(first["direction"]))
+    delta = tuple(second["origin"][i] - first["origin"][i] for i in range(3))
+    projection = sum(delta[i] * direction[i] for i in range(3))
+    perpendicular = tuple(delta[i] - projection * direction[i] for i in range(3))
+    return math.sqrt(sum(item * item for item in perpendicular))
+
+
+def group_coaxial_cylinders(records: list[dict], angle_degrees: float = 2.0, distance_mm: float = 1.0) -> list[dict]:
+    """按轴线夹角和最短垂距分组，避免要求圆柱面原点完全相等。"""
+    groups: list[dict] = []
+    cosine_limit = math.cos(math.radians(angle_degrees))
+    for source in records:
+        record = {**source, "direction": _canonical_axis(tuple(source["direction"]))}
+        target = None
+        for group in groups:
+            reference = group["records"][0]
+            dot = abs(sum(record["direction"][i] * reference["direction"][i] for i in range(3)))
+            if dot >= cosine_limit and _axis_distance(record, reference) <= distance_mm:
+                target = group; break
+        if target is None:
+            target = {"records": [], "area": 0.0, "diameters": [], "count": 0,
+                      "axis_direction": record["direction"], "axis_distance_tolerance_mm": distance_mm}
+            groups.append(target)
+        target["records"].append(record); target["area"] += float(record.get("area", 0.0))
+        target["diameters"].append(round(float(record.get("radius", 0.0)) * 2, 2)); target["count"] += 1
+    for group in groups:
+        group["diameters"] = sorted(set(group["diameters"]), reverse=True); group.pop("records", None)
+    return sorted(groups, key=lambda item: item["area"], reverse=True)
+
+
 def analyze_step(file_bytes: bytes, material: str, config: dict) -> dict:
     try:
         from OCP.BRepAdaptor import BRepAdaptor_Surface
@@ -59,20 +105,15 @@ def analyze_step(file_bytes: bytes, material: str, config: dict) -> dict:
                     axis = cylinder.Axis(); direction = axis.Direction(); location = axis.Location()
                     props = GProp_GProps(); BRepGProp.SurfaceProperties_s(face, props)
                     cylinder_records.append({"radius": float(cylinder.Radius()), "area": float(props.Mass()),
-                                             "direction": (round(abs(direction.X()), 2), round(abs(direction.Y()), 2), round(abs(direction.Z()), 2)),
-                                             "origin": (round(location.X(), -1), round(location.Y(), -1), round(location.Z(), -1))})
+                                             "direction": (float(direction.X()), float(direction.Y()), float(direction.Z())),
+                                             "origin": (float(location.X()), float(location.Y()), float(location.Z()))})
                 except Exception:
                     pass
             elif kind == GeomAbs_BSplineSurface:
                 spline_count += 1
             explorer.Next()
         # 相同方向、接近同一中心的圆柱面是车床强信号；只统计面积大于阈值的组。
-        groups: dict[tuple, dict] = {}
-        for record in cylinder_records:
-            key = (record["direction"], record["origin"])
-            group = groups.setdefault(key, {"area": 0.0, "diameters": [], "count": 0})
-            group["area"] += record["area"]; group["diameters"].append(round(record["radius"]*2, 1)); group["count"] += 1
-        cylinder_groups = sorted(groups.values(), key=lambda group: group["area"], reverse=True)
+        cylinder_groups = group_coaxial_cylinders(cylinder_records)
         largest_plane = max(planar_areas, default=0.0)
         total_plane = sum(planar_areas)
         return {"available": True, "dimensions": dimensions, "volume_mm3": volume_mm3, "net_weight": net_weight,
