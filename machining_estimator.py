@@ -125,6 +125,10 @@ def estimate_operations(step: dict, drawing: dict, config: dict, product_type: s
     for group in drawing.get("thread_groups", []):
         diameter, count = group["直径"], group["数量"]
         device_time = 0.012 if diameter <= 6 else (0.018 if diameter <= 12 else 0.030)
+        # 底孔加工独立为设备工序；无论后续选人工还是设备攻牙，底孔仍需 CNC/龙门/卧加完成。
+        drill_time = (0.010 if diameter <= 6 else (0.015 if diameter <= 12 else 0.025)) * count
+        rows.append(_row(f"{group['规格']} 螺纹底孔", primary, drill_time, f"图纸识别 {group['规格']}，共 {count} 个；底孔由设备钻削", "中", "基础", True,
+                         calculation_type="每件", count=count))
         rows.append(_row(f"{group['规格']} 螺纹加工", primary, device_time, f"图纸识别 {group['规格']}，共 {count} 个；请确认攻牙方式", "中", "基础", False,
                          calculation_type="每件", count=count, tapping_mode="待确认"))
     return {"rows": rows, "classification": classification, "evidence": evidence, "programming_hours": programming,

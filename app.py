@@ -19,6 +19,9 @@ def init_state() -> None:
     st.session_state.setdefault("analysis_rows", [])
     st.session_state.setdefault("drawing", {})
     st.session_state.setdefault("step", {})
+    st.session_state.setdefault("tier_rows", [{"数量": 1, "批量效率系数": 1.00}, {"数量": 5, "批量效率系数": 1.00},
+                                               {"数量": 10, "批量效率系数": 0.98}, {"数量": 50, "批量效率系数": 0.95},
+                                               {"数量": 100, "批量效率系数": 0.93}])
 
 
 def _surface_rows(config: dict) -> list[dict]:
@@ -111,6 +114,7 @@ def pricing_page(config: dict) -> None:
             product_number = st.text_input("产品编号", value=str(fields.get("product_number", "")))
         with b:
             quantity = st.number_input("数量（单件参数按此数量汇总）", min_value=1, value=int(fields.get("quantity", 1)), step=1)
+            sample_quantity = st.number_input("打样数量", min_value=1, value=1, step=1, help="打样单价会把全部一次性费用按此数量分摊。")
             product_type = st.selectbox("产品类型", ["自动识别", "大型机架/床身", "箱体/多方向孔系", "横梁支架", "小型阀体", "其他"])
             fixture_count = st.number_input("装夹次数（复核用）", min_value=0, value=0, step=1)
         with c:
@@ -125,59 +129,70 @@ def pricing_page(config: dict) -> None:
         surfaces = st.data_editor(pd.DataFrame(_surface_rows(config)), use_container_width=True, hide_index=True, key="surface_editor")
         st.subheader("其他成本项目")
         additional = st.data_editor(pd.DataFrame(_additional_rows(drawing)), use_container_width=True, hide_index=True, key="additional_editor")
+        st.subheader("阶梯批量报价")
+        st.caption("效率系数只降低每件上下料、夹紧、换刀、测量、倒角和去毛刺等辅助时间；材料、纯切削、钻孔和攻牙不降低。")
+        tier_editor = st.data_editor(pd.DataFrame(st.session_state["tier_rows"]), use_container_width=True, hide_index=True, num_rows="dynamic", key="tier_editor")
         submitted = st.form_submit_button("计算报价", type="primary")
     if submitted:
         if not customer or not product_name: st.error("请填写客户名称和产品名称。"); return
         rows = st.session_state.get("analysis_rows", [])
         if not rows: st.warning("尚未确认自动工序，请手动新增工序或先分析 STEP/PDF。")
         data = {"customer": customer, "product_name": product_name, "product_number": product_number, "quantity": quantity, "product_type": product_type,
-                "fixture_count": fixture_count, "material": material, "net_weight": net_weight, "casting_weight": casting_weight, "quote_mode": quote_mode,
+                "fixture_count": fixture_count, "sample_quantity": sample_quantity, "tier_rows": tier_editor.to_dict("records"), "material": material, "net_weight": net_weight, "casting_weight": casting_weight, "quote_mode": quote_mode,
                 "casting_sales_rate": sale_rate, "packaging_mode": packaging_mode, "packaging_cost": packaging_cost, "surface_area_m2": step.get("total_planar_area_m2", 0.0), "surfaces": surfaces.to_dict("records")}
         result = calculate_quote(data, rows, config, additional.to_dict("records"), surfaces.to_dict("records"))
+        st.session_state["tier_rows"] = data["tier_rows"]
         st.session_state["quote"] = (data, result, additional.to_dict("records"))
     if "quote" not in st.session_state: return
     data, result, _ = st.session_state["quote"]
-    st.subheader("报价结果")
-    st.caption(f"基础工时 {result['base_time']:.2f} h；精度/检验追加工时 {result['extra_time']:.2f} h；未确认追加项不会计入报价。")
+    st.subheader("报价总览")
+    st.caption("打样与批量报价使用不同的数量分摊一次性费用；未确认的精度/检验或攻牙工序不会计入报价。")
     cal = calibration(data["product_type"])
     formula_time = result["base_time"] + result["extra_time"]
     st.caption(f"公式估算 {formula_time:.2f} h；历史相似产品修正 {formula_time * cal['factor']:.2f} h（系数 {cal['factor']:.2f}）；最终仍以已确认工序为准。")
-    for cols in [[("单件成本", result["unit_cost"]), ("单件报价", result["unit_price"]), ("一次性费用", result["one_time_cost"])], [("整批成本", result["batch_cost"]), ("整批报价", result["batch_price"]), ("单件分摊加工费", result["equipment_per_unit"])]]:
-        for col, (label, value) in zip(st.columns(3), cols): col.metric(label, f"¥ {value:,.2f}")
-    for col, (label, value) in zip(st.columns(5), [
-        ("单件纯切削时间", result["pure_cutting_time"]),
-        ("单件上下料装夹", result["loading_time"]),
-        ("单件设备占机时间", result["batch_equipment_time"] / max(1, data["quantity"])),
-        ("整批一次性准备", result["batch_preparation_time"]),
-        ("整批设备总时间", result["batch_equipment_time"]),
-    ]): col.metric(label, f"{value:.2f} h")
+    for col, (label, value, note) in zip(st.columns(4), [
+        ("打样单价", result["sample_unit_price"], f"打样 {result['sample_quantity']} 件"),
+        ("批量单价", result["unit_price"], f"本次批量 {data['quantity']} 件"),
+        ("整批报价", result["batch_price"], "批量单价 × 数量"),
+        ("批量平均单件成本", result["unit_cost"], "含一次性费用分摊"),
+    ]): col.metric(label, f"¥ {value:,.2f}", note)
+    st.subheader("单件成本组成")
+    for col, (label, value) in zip(st.columns(4), [
+        ("单件材料成本", result["casting_per_unit"]), ("单件设备加工费", result["equipment_per_unit"]),
+        ("单件人工成本", result["labor_per_unit"]), ("单件表面处理、包装及其他", result["surface_per_unit"] + result["packaging_per_unit"]),
+    ]): col.metric(label, f"¥ {value:,.2f}")
+    with st.expander("工时与设备占机摘要", expanded=False):
+        for col, (label, value) in zip(st.columns(5), [
+            ("单件纯切削时间", result["pure_cutting_time"]), ("单件上下料时间", result["loading_time"]),
+            ("每批一次性准备", result["batch_preparation_time"]),
+            ("单件人工时间", result["labor_per_unit"] / max(1, config.get("manual_labor_rate", 35.0))),
+            ("整批设备总时间", result["batch_equipment_time"]),
+        ]): col.metric(label, f"{value:.2f} h")
     if result.get("pair_warning"):
         st.warning("本批数量为奇数，存在按对产品工序；最后一件没有匹配件，不能承诺成对等高交付。")
-    st.subheader("单件成本明细")
-    material_label = "铸件成本" if result["quote_mode"] == "成本加利润" else "铸件直接销售价"
-    material_detail = pd.DataFrame([{
-        "项目": material_label, "计算方式": f"{data['casting_weight']:.2f} kg × ¥{result['material_rate']:.2f}/kg",
-        "单件金额（元）": round(result["casting_per_unit"], 2), "说明": "毛坯计价重量"}])
-    st.dataframe(material_detail, use_container_width=True, hide_index=True)
-    process_details = [{
-        "工序名称": item["工序"], "计算类型": item["计算类型"], "设备": item["设备"], "数量": item["数量"],
-        "单件时间(h)": item["单件时间(h)"], "每批时间(h)": item["每批时间(h)"],
-        "整批总时间(h)": round(item["整批设备时间(h)"] + item["整批人工时间(h)"], 3),
-        "单价(元/h)": item["单价(元/h)"], "整批金额(元)": round(item["整批金额(元)"], 2),
-        "判断依据": item["判断依据"],
-    } for item in result.get("operation_schedules", [])]
-    st.subheader("加工费明细（按批次计算）")
-    st.dataframe(pd.DataFrame(process_details), use_container_width=True, hide_index=True)
-    other_details = [{"项目": "表面处理合计", "单件金额（元）": round(result["surface_per_unit"], 2), "说明": "多选处理、最低收费及附加费"},
-                     {"项目": "包装", "单件金额（元）": round(result["packaging_per_unit"], 2), "说明": data["packaging_mode"]},
-                     {"项目": "整批一次性工序", "单件金额（元）": round(result["operation_one_time_cost"], 2), "说明": "编程、首件准备、首次找正等"},
-                     {"项目": "其他整批一次性费用", "单件金额（元）": round(result["additional_one_time_cost"], 2), "说明": "夹具、模具、运输、首件检测等"}]
+    st.subheader("一次性费用（整批仅计算一次）")
+    one_time_rows = [{"项目": item["工序"], "设备/人工": item["设备"], "整批金额（元）": round(item["整批金额(元)"], 2)}
+                     for item in result.get("operation_schedules", []) if item["计算类型"] in {"每批一次", "手动总价"}]
     for item in result.get("additional_details", []):
-        other_details.append({"项目": item["名称"], "单件金额（元）": round(item["金额"], 2), "说明": item["方式"]})
-    st.subheader("表面处理、其他费用与一次性费用")
-    st.dataframe(pd.DataFrame(other_details), use_container_width=True, hide_index=True)
-    st.subheader("已确认工序与识别依据")
-    st.dataframe(pd.DataFrame(result["confirmed_rows"]), use_container_width=True, hide_index=True)
+        if item["方式"] == "整批一次性费用":
+            one_time_rows.append({"项目": item["名称"], "设备/人工": "外协/其他", "整批金额（元）": round(item["金额"], 2)})
+    one_time_rows.append({"项目": "一次性费用合计", "设备/人工": "—", "整批金额（元）": round(result["one_time_cost"], 2)})
+    st.dataframe(pd.DataFrame(one_time_rows), use_container_width=True, hide_index=True)
+    st.subheader("阶梯批量报价")
+    st.dataframe(pd.DataFrame(result.get("tier_results", [])), use_container_width=True, hide_index=True)
+    brief_processes = [{"工序": item["工序"], "计算类型": item["计算类型"], "设备/人工": item["设备"],
+                        "单件时间(h)": round(item["单件时间(h)"], 3),
+                        "批量总时间(h)": round(item["整批设备时间(h)"] + item["整批人工时间(h)"], 3),
+                        "单件成本（元）": round(item["整批金额(元)"] / max(1, data["quantity"]), 2)}
+                       for item in result.get("operation_schedules", [])]
+    with st.expander("工序详情", expanded=False):
+        st.dataframe(pd.DataFrame(brief_processes), use_container_width=True, hide_index=True)
+        with st.expander("工程计算详情", expanded=False):
+            detailed = [{"工序": item["工序"], "执行方式": item.get("执行方式", ""), "计算类型": item["计算类型"], "设备/人工": item["设备"], "数量": item["数量"],
+                         "单孔时间(h)": item.get("单孔时间(h)", 0), "单件时间(h)": item["单件时间(h)"], "每批时间(h)": item["每批时间(h)"],
+                         "整批设备时间(h)": item["整批设备时间(h)"], "整批人工时间(h)": item["整批人工时间(h)"], "单价(元/h)": item["单价(元/h)"],
+                         "整批金额(元)": item["整批金额(元)"], "判断依据": item["判断依据"]} for item in result.get("operation_schedules", [])]
+            st.dataframe(pd.DataFrame(detailed), use_container_width=True, hide_index=True)
     left, right = st.columns(2)
     if left.button("保存报价", type="primary"): save_quote(data, result, config); st.success("已保存历史报价。")
     right.download_button("导出 Excel 报价单", quote_excel(data, result, config), file_name=f"报价单_{data['product_name']}.xlsx")
