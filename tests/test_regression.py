@@ -85,7 +85,7 @@ class RegressionTests(unittest.TestCase):
             rows.append({"工序": f"{name} 螺纹底孔", "计算类型": "每件", "推荐设备": "CNC加工中心", "数量": count,
                          "单件时间(h)": count * 0.01, "用户确认": True})
             rows.append({"工序": f"{name} 螺纹加工", "计算类型": "每件", "推荐设备": "CNC加工中心", "攻牙设备": "CNC加工中心",
-                         "数量": count, "单件时间(h)": 0.012, "人工单孔时间(h)": 0.03, "攻牙方式": "人工攻牙", "用户确认": True})
+                         "数量": count, "单件时间(h)": 0.012, "人工单孔时间(h)": 0.03, "攻牙方式": "人工攻牙", "用户确认": False})
         data = {"quantity": 100, "sample_quantity": 1, "tier_rows": [{"数量": 100}], "material": "灰铁", "net_weight": 1,
                 "casting_weight": 1.2, "quote_mode": "成本加利润", "packaging_mode": "单件费用"}
         result = calculate_quote(data, rows, DEFAULT_CONFIG, [{"启用": True, "项目": "首件检测费", "计价方式": "整批一次性费用", "金额": 243}], [])
