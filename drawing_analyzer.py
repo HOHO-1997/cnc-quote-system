@@ -126,6 +126,8 @@ def normalize_engineering_text(text: str) -> str:
     """逐行恢复 OCR/PDF 拆开的工程标注，绝不把不同图框行拼在一起。"""
     lines = []
     for raw in text.splitlines():
+        # PyPDF 常输出数学直径符号 ∅，统一成工程图常用 Ø，避免孔特征漏识别。
+        raw = raw.replace("\u2205", "\u00d8")
         line = raw.replace("＊", "×").replace("X", "×").replace("x", "×")
         line = re.sub(r"(?<=\d)\s*\.\s*(?=\d)", ".", line)
         # PDF/OCR 常把小数末位和公差等级拆开，如 7 . 1 0、6 H。
@@ -133,6 +135,8 @@ def normalize_engineering_text(text: str) -> str:
         line = re.sub(r"(\d)\s+([HhGg])\b", r"\1\2", line)
         line = re.sub(r"([+\-])\s*(\d)", r"\1\2", line)
         line = re.sub(r"(?<=M)\s*(\d(?:\s*\d)*)", lambda m: "".join(m.group(1).split()), line, flags=re.I)
+        # 直径后面的数字也可能被逐个拆开：Ø 1 0 5、Ø 7 . 1 0。
+        line = re.sub(r"Ø\s*([0-9][0-9 .]*)", lambda m: "Ø" + re.sub(r"\s+", "", m.group(1)), line)
         line = re.sub(r"([ØΦφ])\s*(\d(?:\s*\d)*)", lambda m: "Ø" + "".join(m.group(2).split()), line)
         line = re.sub(r"\s*×\s*", "×", line)
         line = re.sub(r"\s*([-+/])\s*", r"\1", line)
