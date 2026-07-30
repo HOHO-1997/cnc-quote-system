@@ -150,6 +150,7 @@ def calculate_quote(data: dict, rows: list[dict], config: dict, additional: list
             "other_labor_per_unit": max(0.0, labor_batch / quantity - tapping_labor_batch / quantity),
             "casting_per_unit": casting_per_unit, "material_rate": material_rate, "equipment_per_unit": equipment_batch / quantity,
             "labor_per_unit": labor_batch / quantity, "surface_per_unit": surface_per_unit, "packaging_per_unit": packaging_per_unit,
+            "other_per_unit": per_unit_extra,
             "operation_schedules": schedules, "base_time": sum(s["整批设备时间(h)"] + s["整批人工时间(h)"] for s in base_schedules) / quantity,
             "extra_time": sum(s["整批设备时间(h)"] + s["整批人工时间(h)"] for s in extra_schedules) / quantity,
             "pure_cutting_time": pure_cutting, "loading_time": loading, "batch_preparation_time": batch_prepare,

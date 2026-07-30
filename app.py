@@ -243,10 +243,10 @@ def pricing_page(config: dict) -> None:
     st.subheader("单件成本组成")
     for col, (label, value) in zip(st.columns(5), [
         ("单件材料成本", result["casting_per_unit"]), ("原单件加工费", result["raw_processing_per_unit"]),
-        ("优惠后单件加工费", result["discounted_processing_per_unit"]), ("单件人工攻牙费", result["tapping_labor_per_unit"]),
-        ("单件表面处理、包装及其他", result["surface_per_unit"] + result["packaging_per_unit"]),
+        ("优惠后单件加工费", result["discounted_processing_per_unit"]), ("其中人工攻牙费（已含）", result["tapping_labor_per_unit"]),
+        ("单件热处理、表处、包装及其他", result["other_per_unit"] + result["surface_per_unit"] + result["packaging_per_unit"]),
     ]): col.metric(label, f"¥ {value:,.2f}")
-    st.info(f"本批 {data['quantity']} 件加工费折扣：{result['processing_discount']:.0%}；原单件加工费 ¥{result['raw_processing_per_unit']:.2f} → 优惠后 ¥{result['discounted_processing_per_unit']:.2f}；一次性费用 ¥{result['one_time_cost']:.2f}，单件分摊 ¥{result['one_time_per_unit']:.2f}。")
+    st.info(f"核对公式：材料 ¥{result['casting_per_unit']:.2f} + 优惠后加工费 ¥{result['discounted_processing_per_unit']:.2f} + 热处理/表处/包装/其他 ¥{result['other_per_unit'] + result['surface_per_unit'] + result['packaging_per_unit']:.2f} + 一次性费用分摊 ¥{result['one_time_per_unit']:.2f} = 批量平均单件成本 ¥{result['unit_cost']:.2f}。人工攻牙费已包含在“优惠后单件加工费”中，请勿重复相加。")
     with st.expander("工时与设备占机摘要", expanded=False):
         for col, (label, value) in zip(st.columns(5), [
             ("单件纯切削时间", result["pure_cutting_time"]), ("单件上下料时间", result["loading_time"]),
