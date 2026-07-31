@@ -134,7 +134,8 @@ def normalize_engineering_text(text: str) -> str:
         line = re.sub(r"(\d+\.\d)\s+(\d)\b", r"\1\2", line)
         line = re.sub(r"(\d)\s+([HhGg])\b", r"\1\2", line)
         line = re.sub(r"([+\-])\s*(\d)", r"\1\2", line)
-        line = re.sub(r"(?<=M)\s*(\d(?:\s*\d)*)", lambda m: "".join(m.group(1).split()), line, flags=re.I)
+        # 仅合并真正逐位拆开的 M 7 2，不能把正常的 “M5 10(深度)” 拼成 M510。
+        line = re.sub(r"M\s+(\d)\s+(\d)(?:\s+(\d))?", lambda m: "M" + "".join(x for x in m.groups() if x), line, flags=re.I)
         # 直径后面的数字也可能被逐个拆开：Ø 1 0 5、Ø 7 . 1 0。
         line = re.sub(r"Ø\s*([0-9][0-9 .]*)", lambda m: "Ø" + re.sub(r"\s+", "", m.group(1)), line)
         line = re.sub(r"([ØΦφ])\s*(\d(?:\s*\d)*)", lambda m: "Ø" + "".join(m.group(2).split()), line)
@@ -180,6 +181,24 @@ def analyze_drawing(text: str) -> dict:
                               "through": through, "countersink": "沉头" in tail or "锪" in tail, "counterbore": "沉孔" in tail or "锪平" in tail,
                               "reamed": "铰" in tail, "tolerance": (m.group("tol") or "").strip() or None,
                               "source_text": m.group(0), "confidence": "高" if through or depth_m else "中"})
+    # 大型装配图常将孔写成“6×33通”“2×20贯穿”，没有 Ø 符号。
+    # 只在带通孔/贯穿/明确公差时作为孔，避免把普通 4×120 尺寸阵列误判成孔。
+    known_holes = {(round(item["diameter"], 4), item["count"]) for item in hole_features}
+    for line in engineering.splitlines():
+        plain_hole = re.search(r"(?P<count>\d+)\s*[×xX]\s*(?P<dia>\d+(?:\.\d+)?)(?P<tail>.*)$", line)
+        if not plain_hole:
+            continue
+        tail = plain_hole.group("tail")
+        has_hole_signal = bool(re.search(r"通孔|贯穿|通\b|\bTHRU\b|\bTHROUGH\b|(?:[+\-]\d+(?:\.\d+)?)", tail, re.I))
+        if not has_hole_signal:
+            continue
+        count, diameter = int(plain_hole.group("count")), float(plain_hole.group("dia"))
+        if not (0.5 <= diameter <= 500) or (round(diameter, 4), count) in known_holes:
+            continue
+        through = bool(re.search(r"通孔|贯穿|通\b|\bTHRU\b|\bTHROUGH\b", tail, re.I))
+        hole_features.append({"diameter": diameter, "count": count, "depth": None, "through": through,
+                              "countersink": False, "counterbore": False, "reamed": False,
+                              "tolerance": None, "source_text": line, "confidence": "中" if through else "低"})
     dimensional_tolerances = []
     for m in re.finditer(r"(?:[ØΦφ]?\d+(?:\.\d+)?)\s*±\s*(\d+(?:\.\d+)?)", engineering):
         value = float(m.group(1))
