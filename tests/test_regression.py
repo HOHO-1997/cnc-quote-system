@@ -52,6 +52,23 @@ class RegressionTests(unittest.TestCase):
         self.assertIn((8, 23.0, True), holes)
         self.assertIn((2, 24.0, True), holes)
 
+    def test_note_numbers_are_not_threads_and_u_slot_is_separate_setup(self):
+        text = "MATERIAL SPECIFICATIONS\nM1. MATERIAL: GRADE 80-55-6\nM2. FINISH: E-COAT\nM3. MANUFACTURING PROCESS: SAND CAST\nM4. CLEANLINESS\nM5. NO CHANGES\nMACHINING DATUM TARGETS\nPOST MACHINED\nSECTION A-A\nSECTION B-B\n12.25 \u00b10.202X THRU\n11.0 \u00b10.22X THRU"
+        drawing = analyze_drawing(text)
+        self.assertEqual(drawing["threaded_count"], 0)
+        self.assertEqual(drawing["rejected_thread_notes"], ["M1", "M2", "M3", "M4", "M5"])
+        self.assertTrue(drawing["slot_candidate"]["candidate"])
+        self.assertGreaterEqual(drawing["drilled_count"], 4)
+        mock_step = step([153, 96, 79], 1.354, 1.55, 0.08)
+        result = estimate_operations(mock_step, drawing, DEFAULT_CONFIG)
+        rows = result["rows"]
+        machining_rows = [row for row in rows if row["\u63a8\u8350\u8bbe\u5907"] == "CNC\u52a0\u5de5\u4e2d\u5fc3"]
+        machine_time = sum(row["\u63a8\u8350\u65f6\u95f4(h)"] for row in machining_rows)
+        self.assertTrue(any("U\u5f62\u69fd" in row["\u5de5\u5e8f"] and row.get("\u88c5\u5939\u7f16\u53f7") == "OP20" for row in rows))
+        self.assertEqual({row.get("\u88c5\u5939\u7f16\u53f7") for row in rows if row.get("\u88c5\u5939\u7f16\u53f7")}, {"OP10", "OP20"})
+        self.assertGreaterEqual(machine_time, 2.3)
+        self.assertLessEqual(machine_time, 2.7)
+
     def test_coaxial_grouping_allows_different_axis_origins(self):
         records = [
             {"radius": 36, "area": 100, "direction": (0, 0, 1), "origin": (0, 0, 0)},
