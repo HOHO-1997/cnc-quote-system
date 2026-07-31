@@ -52,6 +52,17 @@ def group_coaxial_cylinders(records: list[dict], angle_degrees: float = 2.0, dis
     return sorted(groups, key=lambda item: item["area"], reverse=True)
 
 
+def group_planar_directions(records: list[dict]) -> list[dict]:
+    """按平面法向归类；同一刀轴方向可优先在同次装夹完成。"""
+    groups: dict[tuple[float, float, float], dict] = {}
+    for record in records:
+        axis = _canonical_axis(tuple(record["direction"]))
+        key = tuple(round(abs(item), 1) for item in axis)
+        group = groups.setdefault(key, {"direction": axis, "area": 0.0, "count": 0})
+        group["area"] += float(record.get("area", 0.0)); group["count"] += 1
+    return sorted(groups.values(), key=lambda item: item["area"], reverse=True)
+
+
 def analyze_step(file_bytes: bytes, material: str, config: dict) -> dict:
     try:
         from OCP.BRepAdaptor import BRepAdaptor_Surface
@@ -88,7 +99,7 @@ def analyze_step(file_bytes: bytes, material: str, config: dict) -> dict:
         net_weight = volume_mm3 * density / 1_000_000
         blank_factor = float(config["casting_blank_factors"].get(material, 1.2))
         blank_weight = net_weight * blank_factor
-        planar_areas, cylinder_records = [], []
+        planar_areas, planar_records, cylinder_records = [], [], []
         face_count = cylinder_count = spline_count = 0
         explorer = TopExp_Explorer(shape, TopAbs_FACE)
         while explorer.More():
@@ -97,7 +108,12 @@ def analyze_step(file_bytes: bytes, material: str, config: dict) -> dict:
             kind = surface.GetType(); face_count += 1
             if kind == GeomAbs_Plane:
                 props = GProp_GProps(); BRepGProp.SurfaceProperties_s(face, props)
-                planar_areas.append(max(0.0, props.Mass()))
+                area = max(0.0, props.Mass()); planar_areas.append(area)
+                try:
+                    direction = surface.Plane().Axis().Direction()
+                    planar_records.append({"area": area, "direction": (float(direction.X()), float(direction.Y()), float(direction.Z()))})
+                except Exception:
+                    pass
             elif kind == GeomAbs_Cylinder:
                 cylinder_count += 1
                 try:
@@ -114,12 +130,14 @@ def analyze_step(file_bytes: bytes, material: str, config: dict) -> dict:
             explorer.Next()
         # 相同方向、接近同一中心的圆柱面是车床强信号；只统计面积大于阈值的组。
         cylinder_groups = group_coaxial_cylinders(cylinder_records)
+        planar_direction_groups = group_planar_directions(planar_records)
         largest_plane = max(planar_areas, default=0.0)
         total_plane = sum(planar_areas)
         return {"available": True, "dimensions": dimensions, "volume_mm3": volume_mm3, "net_weight": net_weight,
                 "blank_weight": blank_weight, "blank_factor": blank_factor, "face_count": face_count,
                 "cylinder_count": cylinder_count, "spline_count": spline_count, "largest_planar_area_m2": largest_plane/1_000_000,
                 "total_planar_area_m2": total_plane/1_000_000, "cylinder_groups": cylinder_groups[:8],
+                "planar_direction_groups": planar_direction_groups[:8],
                 "message": "STEP 实体分析完成。"}
     except Exception as error:
         return {"available": False, "message": f"STEP 几何分析失败：{error}"}

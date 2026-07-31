@@ -171,6 +171,18 @@ def analyze_drawing(text: str) -> dict:
         thread_features.append({"specification": specification, "nominal_diameter": dia, "pitch": _number_or_none(m.group("pitch")),
                                 "tolerance_class": m.group("class").upper() if m.group("class") else None, "count": count,
                                 "depth": _number_or_none(m.group("depth")), "through": False, "source_text": m.group(0), "confidence": "高"})
+    # 备注/材料说明中的 M1、M2……是条款编号，不是螺纹。孤立 M 数字没有数量、螺距、等级、深度或 THRU 时一律不计价。
+    rejected_thread_notes = []
+    qualified_threads = []
+    for feature in thread_features:
+        source = str(feature["source_text"])
+        qualified = ("×" in source or "x" in source.lower() or feature.get("pitch") is not None or
+                     feature.get("tolerance_class") is not None or bool(re.search(r"THRU|DEPTH|深", source, re.I)))
+        if not qualified:
+            rejected_thread_notes.append(source)
+            continue
+        qualified_threads.append(feature)
+    thread_features = qualified_threads
     # 孔必须以 Ø/Φ 开头；通/贯穿/THRU 与深/DEPTH 分别保存，不能视为螺纹。
     hole_re = re.compile(r"(?:(?P<count>\d+)\s*[-×]\s*)?[ØΦφ](?P<dia>\d+(?:\.\d+)?)(?P<tol>\s*[+\-]\d+(?:\.\d+)?\s*/?\s*[+\-]?\d*(?:\.\d+)?)?(?P<tail>[^\n]{0,30})", re.I)
     for m in hole_re.finditer(engineering):
@@ -181,6 +193,17 @@ def analyze_drawing(text: str) -> dict:
                               "through": through, "countersink": "沉头" in tail or "锪" in tail, "counterbore": "沉孔" in tail or "锪平" in tail,
                               "reamed": "铰" in tail, "tolerance": (m.group("tol") or "").strip() or None,
                               "source_text": m.group(0), "confidence": "高" if through or depth_m else "中"})
+    # 英文图纸常把孔写成“12.25 ±0.20 2X THRU”，数量在尺寸之后且没有 Ø。
+    for line in engineering.splitlines():
+        english_hole = re.search(r"(?P<dia>\d+(?:\.\d+)?)\s*±\s*(?P<tol>0?\.\d{1,2})\s*(?P<count>\d+)\s*[×Xx]\s*(?P<thru>THRU|THROUGH)\b", line, re.I)
+        if not english_hole:
+            continue
+        diameter, count = float(english_hole.group("dia")), int(english_hole.group("count"))
+        if not 0.5 <= diameter <= 500:
+            continue
+        hole_features.append({"diameter": diameter, "count": count, "depth": None, "through": True,
+                              "countersink": False, "counterbore": False, "reamed": False,
+                              "tolerance": "±" + english_hole.group("tol"), "source_text": line, "confidence": "高"})
     # 大型装配图常将孔写成“6×33通”“2×20贯穿”，没有 Ø 符号。
     # 只在带通孔/贯穿/明确公差时作为孔，避免把普通 4×120 尺寸阵列误判成孔。
     known_holes = {(round(item["diameter"], 4), item["count"]) for item in hole_features}
@@ -229,13 +252,25 @@ def analyze_drawing(text: str) -> dict:
         extra_sources.append({"source": f"尺寸公差 ±{min_tolerance:.3f} mm", "hours": 0.20, "recommended_equipment": "CNC加工中心", "confidence": "中"})
     if geometric_tolerances and min(x["value"] for x in geometric_tolerances) <= 0.01:
         extra_sources.append({"source": f"形位精度 {min(x['value'] for x in geometric_tolerances):.3f} mm", "hours": 0.30, "recommended_equipment": "磨床", "confidence": "中"})
+    datum_refs = sorted(set(re.findall(r"\b[A-D]\b", engineering)))
+    section_count = len(re.findall(r"(?:SECTION|剖面)\s*[A-Z]", upper))
+    machining_datums = "MACHINING DATUM" in upper or "加工基准" in engineering
+    post_machined = "POST MACHINED" in upper or "精加工" in engineering
+    # 该提示仅用于提出独立槽工序候选，必须结合 STEP 凹槽几何确认，避免把普通铸造面直接当成槽。
+    slot_candidate = {"candidate": bool(post_machined and machining_datums and section_count >= 2),
+                      "section_count": section_count, "datum_count": len(datum_refs),
+                      "confidence": "中" if post_machined and machining_datums else "低"}
+    machined_surface_estimate = max(1, min(16, 2 + len(datum_refs) + section_count + (2 if post_machined else 0)))
     return {"text_available": bool(engineering.strip()), "normalized_text": engineering, "thread_features": thread_features, "hole_features": hole_features,
             "threads": [(str(x["nominal_diameter"]), str(x["pitch"] or "")) for x in thread_features], "thread_diameters": [x["nominal_diameter"] for x in thread_features],
             "thread_groups": [{"规格": x["specification"], "数量": x["count"], "直径": x["nominal_diameter"]} for x in thread_features], "threaded_count": threaded_count,
             "drilled_count": drilled_count, "dimensional_tolerances": dimensional_tolerances, "geometric_tolerances": geometric_tolerances,
             "geometric_values": [x["value"] for x in geometric_tolerances], "gd_terms": [x["kind"] for x in geometric_tolerances], "roughness": roughness,
             "min_tolerance": min_tolerance, "pair_height_requirement": pair_height, "explicit_grinding": explicit_grinding, "requires_turning": requires_turning,
-            "heat_treatments": heat_treatments, "surface_processes": surface_processes, "tests": tests, "extra_sources": extra_sources}
+            "heat_treatments": heat_treatments, "surface_processes": surface_processes, "tests": tests, "extra_sources": extra_sources,
+            "rejected_thread_notes": rejected_thread_notes, "datum_references": datum_refs, "section_count": section_count,
+            "machining_datums": machining_datums, "post_machined": post_machined,
+            "machined_surface_estimate": machined_surface_estimate, "slot_candidate": slot_candidate}
 
 
 def _number_or_none(value: str | None) -> float | None:

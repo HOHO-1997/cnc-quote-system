@@ -23,6 +23,13 @@ def _fits(step: dict, cap: dict) -> bool:
     return all(a <= b for a, b in zip(dims, travel)) and step.get("net_weight", 0) <= cap.get("max_weight", 0)
 
 
+def _annotate(row: dict, setup: str, direction: str, feature: str, tool: str, detail: str) -> dict:
+    """将自动工时的来源随工序保存，供确认表和导出表人工复核。"""
+    row.update({"装夹编号": setup, "加工方向": direction, "识别特征": feature,
+                "刀具类型": tool, "时间计算依据": detail})
+    return row
+
+
 def estimate_operations(step: dict, drawing: dict, config: dict, product_type: str = "自动识别") -> dict:
     if not step or not step.get("available"):
         return {"rows": [], "summary": "未取得可靠 STEP 实体，无法自动估算；请人工填写工时。", "classification": "不确定"}
@@ -69,6 +76,47 @@ def estimate_operations(step: dict, drawing: dict, config: dict, product_type: s
                 _row("CNC 钻孔、侧孔、斜孔", primary, 0.35, f"识别到约 {drawing.get('drilled_count', 0)} 个成组孔", "中"),
                 _row("CNC 攻牙、倒角与检测", primary, 0.25, f"识别到约 {threads} 个螺纹", "中")]
         programming, fixture = 1.5, 0.5
+    elif drawing.get("slot_candidate", {}).get("candidate") and max_dim <= 800:
+        # 非回转铸件：图纸出现加工基准、后加工面和多个剖面时，STEP 应重点复核内部凹槽。
+        # 时间由加工面/剖面/孔数量和转序计算，不以该零件的历史报价直接写死。
+        classification, primary = "多方向铸件/内部槽加工", "CNC加工中心"
+        surface_count = int(drawing.get("machined_surface_estimate", 6))
+        section_count = int(drawing.get("section_count", 0))
+        hole_groups = len(holes)
+        direction_groups = len(step.get("planar_direction_groups", []))
+        external_finish = 0.34 + surface_count * 0.040 + min(0.15, hole_groups * 0.022)
+        external_rough = 0.25 + surface_count * 0.025
+        slot_depth_factor = min(0.22, 0.04 * max(1, section_count))
+        slot_rough = 0.33 + surface_count * 0.020 + slot_depth_factor
+        slot_finish = 0.18 + surface_count * 0.010 + slot_depth_factor * 0.35
+        transfer = 0.10 + 0.02 * max(1, len(drawing.get("datum_references", [])))
+        inspection = 0.10 + (0.05 if drawing.get("min_tolerance") and drawing["min_tolerance"] <= 0.2 else 0.0)
+        evidence += [f"识别 {surface_count} 个后加工面信号、{section_count} 个剖面和 {len(drawing.get('datum_references', []))} 个基准",
+                     f"STEP 平面法向分为 {direction_groups or '待 STEP 引擎确认'} 组刀轴方向",
+                     "内部凹槽候选与主要平面不在同一刀轴方向，建议第二台 CNC 独立装夹"]
+        rows = [
+            _annotate(_row("设备1：外部基准面、凸台与侧面开粗", primary, external_rough,
+                           "后加工面/基准/剖面数量推导", "中"), "OP10", "+Z/侧向", "底面、凸台端面、耳板和定位面",
+                      "面铣刀/立铣刀", f"{surface_count} 个加工面 × 分层开粗；不含内部槽"),
+            _annotate(_row("设备1：外部平面、孔和凸台精加工", primary, external_finish,
+                           "加工面、孔组及基准 A-D", "中"), "OP10", "+Z/侧向", "外部平面、凸台、孔和侧面",
+                      "面铣刀/钻头/立铣刀", f"{surface_count} 个加工面 + {hole_groups} 组孔的精加工与换刀"),
+            _annotate(_row("设备1：单件上下料、夹紧与基准确认", primary, 0.15,
+                           "第一方向单件重复装夹", "高"), "OP10", "+Z", "外部基准", "压板/夹具", "上料、夹紧、清理定位面、简易找正"),
+            _annotate(_row("转序：设备2重新定位与二次找正", primary, transfer,
+                           "内部槽需单独刀轴方向与装夹", "高"), "OP20", "内腔方向", "转序/二次定位", "专用软爪或定位夹具",
+                      f"{len(drawing.get('datum_references', []))} 个基准关联的转序定位和测量"),
+            _annotate(_row("设备2：内部U形槽分层开粗", primary, slot_rough,
+                           "多个剖面＋后加工基准形成的内部槽候选", "中"), "OP20", "内腔方向", "U形槽底、两侧壁和内圆角",
+                      "长伸出立铣刀", f"{section_count} 个剖面信号；按槽深分层、长径比降速及排屑预留"),
+            _annotate(_row("设备2：内部U形槽底/侧壁/圆角精加工", primary, slot_finish,
+                           "内槽独立精加工，不能并入普通平面铣", "中"), "OP20", "内腔方向", "槽底、侧壁、内部圆弧",
+                      "长颈球刀/立铣刀", "槽底与侧壁精加工、避让、空行程和机内测量"),
+            _annotate(_row("设备2：下机检验与去毛刺", "人工", inspection,
+                           "多基准转序后的尺寸复核", "中"), "OP20", "检验", "基准相关加工面", "量具/去毛刺工具",
+                      "转序后基准尺寸复核、槽口去毛刺"),
+        ]
+        programming, fixture = 1.6 + section_count * 0.15, 0.35 + surface_count * 0.02
     else:
         if not cnc_fit and gantry_fit:
             classification, primary = "大型铣削件", "龙门铣"; evidence.append("超过普通 CNC 行程或承重")
