@@ -38,6 +38,20 @@ class RegressionTests(unittest.TestCase):
         self.assertTrue(features[7.1]["through"])
         self.assertEqual(features[2.4]["count"], 2)
 
+    def test_large_frame_plain_hole_and_thread_annotations(self):
+        # 大型机架图纸常不用 Ø，而写成 6×33通、2×24贯穿；螺纹深度与规格之间有空格。
+        text = "8 x M5 10\n9 x M6 12\n4 x M30 50\n12 x M8 16\n12 x M12 24\n6X 33\u901a\n2X 20\u8d2f\u7a7f\n8x 23 \u8d2f\u7a7f\n2X 24 \u8d2f\u7a7f\n24 x M10 24"
+        drawing = analyze_drawing(text)
+        threads = {(item["\u89c4\u683c"], item["\u6570\u91cf"]) for item in drawing["thread_groups"]}
+        holes = {(item["count"], item["diameter"], item["through"]) for item in drawing["hole_features"]}
+        self.assertIn(("M5", 8), threads)
+        self.assertIn(("M30", 4), threads)
+        self.assertIn(("M10", 24), threads)
+        self.assertIn((6, 33.0, True), holes)
+        self.assertIn((2, 20.0, True), holes)
+        self.assertIn((8, 23.0, True), holes)
+        self.assertIn((2, 24.0, True), holes)
+
     def test_coaxial_grouping_allows_different_axis_origins(self):
         records = [
             {"radius": 36, "area": 100, "direction": (0, 0, 1), "origin": (0, 0, 0)},
