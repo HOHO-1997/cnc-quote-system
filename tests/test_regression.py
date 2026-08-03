@@ -4,7 +4,7 @@ from config import DEFAULT_CONFIG
 from export import quote_excel
 from machining_estimator import estimate_operations
 from pricing import calculate_quote
-from drawing_analyzer import analyze_drawing, normalize_engineering_text
+from drawing_analyzer import analyze_drawing, normalize_engineering_text, extract_fields
 from step_analyzer import group_coaxial_cylinders
 
 
@@ -206,6 +206,48 @@ class RegressionTests(unittest.TestCase):
         self.assertAlmostEqual(result["equipment_per_unit"], (0.372 + 1.056 + 0.15 + 0.08) * 90, places=2)
         self.assertAlmostEqual(result["tapping_labor_per_unit"], 0.90 * 35, places=2)
         self.assertAlmostEqual(result["raw_processing_per_unit"], 180.72, places=2)
+
+    def test_structured_hole_table_and_large_precision_plate_route(self):
+        text = """标签 大小 数量
+A Ø6.80 19.75
+M8-6H 16 25
+B Ø5 15
+M6-6H 12 12
+J Ø4.20 12.40
+Ø6.20×90° 132
+AC
+Ø2.50 9.50
+M3-6H 8
+Ø3.05×90° 近端
+8
+D
+2×Ø17.5 47.5
+M20-6H 40
+TITLE: DWG NO.
+源鑫豐（香港）科技有限公司
+TEC PHOTOELECTRICITY CO., LIMITED
+X200AS-002-501 X200AS-002
+阴影部分为精度面，要求精磨"""
+        drawing = analyze_drawing(text)
+        table = {row["label"]: row for row in drawing["hole_table_rows"]}
+        self.assertEqual(table["A"]["quantity"], 25)
+        self.assertEqual(table["J"]["quantity"], 132)
+        self.assertEqual(table["AC"]["quantity"], 8)
+        self.assertEqual(drawing["threaded_count"], 47)
+        self.assertTrue(drawing["grinding_required"])
+        fields = extract_fields(text, "fallback-name.pdf")
+        self.assertEqual(fields["company_name"], "源鑫豐（香港）科技有限公司")
+        self.assertEqual(fields["english_company_name"], "TEC PHOTOELECTRICITY CO., LIMITED")
+        self.assertEqual(fields["product_name"], "X200AS-002")
+        self.assertEqual(fields["drawing_number"], "X200AS-002-501")
+        result = estimate_operations(step([1150, 770, 80], 57, 68, 0.85), drawing, DEFAULT_CONFIG)
+        gantry = sum(row["单件时间(h)"] for row in result["rows"] if row["推荐设备"] == "龙门铣")
+        grinding = sum(row["单件时间(h)"] for row in result["rows"] if row["推荐设备"] == "磨床")
+        self.assertEqual(result["classification"], "大型精密板件/多孔铸件")
+        self.assertGreaterEqual(gantry, 28)
+        self.assertLessEqual(gantry, 36)
+        self.assertGreaterEqual(grinding, 6)
+        self.assertLessEqual(grinding, 10)
 
 
 if __name__ == "__main__":
