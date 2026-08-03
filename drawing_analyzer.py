@@ -31,10 +31,13 @@ def extract_pdf(file_bytes: bytes, filename: str) -> tuple[dict, str, bool]:
     used_ocr = False
     # 有些中文 CAD 字体能提取到字符但出现乱码；这时仍要尝试 OCR，不能把乱码当公司名。
     damaged_text = "�" in text or text.count("\ufffd") > 0
-    if len(re.sub(r"\s+", "", text)) < 20 or damaged_text:
+    # 标题栏的嵌入 CAD 字体即使有文字，也可能映射成错误汉字；带有标题栏关键词时
+    # 同步 OCR。型号/图号仍保留矢量文本，中文公司名优先取 OCR 段。
+    title_block_present = bool(re.search(r"(?:公司|COMPANY|PARTS?\s*NO|TITLE|DWG\s*NO)", text, re.I))
+    if len(re.sub(r"\s+", "", text)) < 20 or damaged_text or title_block_present:
         ocr_text = _ocr_pdf(file_bytes)
         if ocr_text:
-            text = text + "\n" + ocr_text
+            text = text + "\n[[OCR_TITLE_TEXT]]\n" + ocr_text
             used_ocr = True
     return extract_fields(text, filename), text, used_ocr
 
@@ -290,10 +293,17 @@ def _title_block_fields(text: str, filename: str = "") -> dict:
     """从标题栏文本识别中英文公司、图名和图号，并保留来源/置信度。"""
     result = _base_extract_fields(text, filename)
     lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines() if line.strip()]
+    # OCR 段只用于中文标题栏内容；矢量文字仍是型号、图号的首选来源。
+    ocr_lines = []
+    if "[[OCR_TITLE_TEXT]]" in text:
+        ocr_lines = [re.sub(r"\s+", " ", line).strip()
+                     for line in text.split("[[OCR_TITLE_TEXT]]", 1)[1].splitlines() if line.strip()]
+    company_lines = ocr_lines or lines
     chinese_companies = []
     english_companies = []
-    for line in lines:
-        if re.search(r"(?:公司|科技有限公司|有限责任公司|股份有限公司)", line) and len(line) <= 80:
+    for line in company_lines:
+        # 含替换字符的 CAD 字体乱码不应作为公司名；OCR 成功后会提供可读中文行。
+        if "�" not in line and re.search(r"(?:公司|科技有限公司|有限责任公司|股份有限公司)", line) and len(line) <= 80:
             chinese_companies.append(line)
         if re.search(r"\b(?:COMPANY|CO\.?|LIMITED|INC\.?|LTD\.?)\b", line, re.I) and len(line) <= 100:
             english_companies.append(line)
@@ -316,6 +326,14 @@ def _title_block_fields(text: str, filename: str = "") -> dict:
     else:
         result.setdefault("identification_source", "文件名备用")
         result.setdefault("identification_confidence", "需要人工确认")
+    # 多数客户图纸并没有单独的“客户名称”字段，标题栏公司就是本次报价的客户。
+    # 有明确 CUSTOMER/客户 字段时保持其优先级，不覆盖。
+    if not str(result.get("customer", "")).strip():
+        customer_candidate = result.get("company_name") or result.get("english_company_name")
+        if str(customer_candidate or "").strip():
+            result["customer"] = customer_candidate
+            result["customer_source"] = result.get("company_name_source", "PDF标题栏")
+            result["customer_confidence"] = result.get("company_name_confidence", "中")
     return result
 
 

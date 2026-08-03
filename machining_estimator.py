@@ -83,14 +83,19 @@ def estimate_operations(step: dict, drawing: dict, config: dict, product_type: s
         countersink_count = sum(int(item.get("count", 0)) for item in holes if item.get("countersink") or item.get("counterbore"))
         hole_groups = max(1, len(holes) + len(drawing.get("thread_features", [])))
         # 孔加工由每孔定位/切削、沉头、设备刚性攻牙、换刀与大件风险组成。
-        drill_hours = sum(float(item.get("count", 0)) * (0.012 + min(float(item.get("diameter", 0)), 25) * 0.00065) for item in holes if not item.get("countersink"))
+        # 螺纹底孔会在下面按规格逐行生成，汇总钻孔中先排除，防止重复计时。
+        thread_labels = {str(item.get("label", "")) for item in drawing.get("thread_features", [])}
+        ordinary_holes = [item for item in holes if str(item.get("label", "")) not in thread_labels]
+        drill_hours = sum(float(item.get("count", 0)) * (0.012 + min(float(item.get("diameter", 0)), 25) * 0.00065)
+                          for item in ordinary_holes if not item.get("countersink"))
         sink_hours = countersink_count * 0.010
         tap_hours = sum(float(item.get("count", 0)) * (0.012 + min(float(item.get("nominal_diameter", 0)), 20) * 0.00070) for item in drawing.get("thread_features", []))
-        hole_total = drill_hours + sink_hours + tap_hours + hole_groups * 0.055 + 1.15 + max_dim / 2600
+        # 攻牙保留为各规格独立工序，供用户逐组改为人工/混合攻牙；此处不再重复计入。
+        hole_total = drill_hours + sink_hours + hole_groups * 0.055 + 1.15 + max_dim / 2600
         # 大平面、正反面、侧向面分别独立装夹；面积/精度只作修正，不按 STEP 面数累加。
-        rough_top = 5.2 + surface_signals * 0.17 + max_dim / 1700
-        finish_top = 4.6 + surface_signals * 0.15 + (0.8 if (drawing.get("min_tolerance") or 1.0) <= 0.05 else 0.3)
-        side_hours = 2.1 + 0.10 * len(drawing.get("datum_references", [])) + min(1.2, hole_count / 400)
+        rough_top = 3.0 + surface_signals * 0.08 + max_dim / 3000
+        finish_top = 2.5 + surface_signals * 0.08 + (0.5 if (drawing.get("min_tolerance") or 1.0) <= 0.05 else 0.2)
+        side_hours = 1.8 + 0.08 * len(drawing.get("datum_references", [])) + min(0.8, hole_count / 800)
         setup_hours = 0.85 + max_dim / 2200 + (0.20 if weight >= 100 else 0.0)
         side_machine = "龙门铣" if _capability(config, "龙门铣").get("side_head", False) else "卧式加工中心"
         evidence += [f"最大尺寸 {max_dim:.0f} mm，预留夹具空间后普通 CNC 不满足；选择龙门铣",
@@ -101,7 +106,7 @@ def estimate_operations(step: dict, drawing: dict, config: dict, product_type: s
             _annotate(_row("OP10 正面基准与凸台平面粗精加工", primary, rough_top + finish_top, "加工面数量、平面面积与精度面信号", "中"), "OP10", "+Z", "正面基准、凸台端面和定位面", "面铣刀/立铣刀", f"{surface_signals} 个加工面信号；粗精加工分开走刀"),
             _annotate(_row("OP20 翻面、背部大平面与支脚面加工", primary, setup_hours + rough_top * 0.70 + finish_top * 0.70, "反面加工方向与翻转重新找正", "高"), "OP20", "-Z", "背部大平面、两个支脚加工面", "吊具/面铣刀", "翻面后重新吊装、定位、开粗和精铣"),
             _annotate(_row("OP30 侧面孔系与 M20 特征加工", side_machine, setup_hours * 0.70 + side_hours, "侧面加工方向；角度头可由龙门完成，否则转卧加", "中"), "OP30", "+X/-X", "端部立面、侧面 M20 与侧孔", "角度头/钻头/镗刀", "侧向特征单独装夹，含二次找正与侧孔加工"),
-            _annotate(_row("OP10/20 孔系钻削、沉孔、沉头与设备刚性攻牙", primary, hole_total, "孔表的数量、孔径、沉头与螺纹逐项累加", "高"), "OP10/20", "+Z/-Z", "孔表 A-AC 与独立孔特征", "钻头/沉头刀/丝锥", f"钻孔 {drill_hours:.2f}h + 沉头 {sink_hours:.2f}h + 攻牙 {tap_hours:.2f}h + 换刀/试切/大件修正"),
+            _annotate(_row("OP10/20 孔系钻削、沉孔与沉头", primary, hole_total, "孔表的数量、孔径、沉头逐项累加；攻牙另列", "高"), "OP10/20", "+Z/-Z", "孔表 A-AC 与独立孔特征", "钻头/沉头刀", f"钻孔 {drill_hours:.2f}h + 沉头 {sink_hours:.2f}h + 换刀/试切/大件修正；攻牙另列"),
             _annotate(_row("OP30 去毛刺、清理与尺寸复核", "人工", 0.80 + hole_count * 0.012, "大量孔口、沉头和精度面保护", "中"), "OP30", "检验", "孔口、精度面和装夹基准", "去毛刺工具/量具", f"{hole_count} 个孔加工动作的孔口处理与抽检"),
         ]
         for row in rows:
@@ -224,15 +229,18 @@ def estimate_operations(step: dict, drawing: dict, config: dict, product_type: s
     rows.extend(loading_rows)
     rows.insert(0, _row("CNC编程、首件工艺准备与试切", primary, 0.0, "编程、首件对刀、试切和程序验证", "中", "基础", True,
                         calculation_type="每批一次", batch_hours=programming))
-    # 螺纹组必须确认攻牙方式；待确认行默认不进入报价。
-    for group in ([] if large_precision_plate else drawing.get("thread_groups", [])):
+    # 螺纹组必须逐行显示。大型孔表件默认推荐设备刚性攻牙，但仍允许改成人工/混合。
+    for group in drawing.get("thread_groups", []):
         diameter, count = group["直径"], group["数量"]
         device_time = 0.012 if diameter <= 6 else (0.018 if diameter <= 12 else 0.030)
         # 底孔加工独立为设备工序；无论后续选人工还是设备攻牙，底孔仍需 CNC/龙门/卧加完成。
         drill_time = (0.010 if diameter <= 6 else (0.015 if diameter <= 12 else 0.025)) * count
         rows.append(_row(f"{group['规格']} 螺纹底孔", primary, drill_time, f"图纸识别 {group['规格']}，共 {count} 个；底孔由设备钻削", "中", "基础", True,
                          calculation_type="每件", count=count))
-        rows.append(_row(f"{group['规格']} 螺纹加工", primary, device_time, f"图纸识别 {group['规格']}，共 {count} 个；请确认攻牙方式", "中", "基础", False,
-                         calculation_type="每件", count=count, tapping_mode="待确认"))
+        default_mode = "设备刚性攻牙" if large_precision_plate else "待确认"
+        rows.append(_row(f"{group['规格']} 螺纹加工", primary, device_time,
+                         f"图纸识别 {group['规格']}，共 {count} 个；" + ("默认设备刚性攻牙，可逐组修改" if large_precision_plate else "请确认攻牙方式"),
+                         "高" if large_precision_plate else "中", "基础", large_precision_plate,
+                         calculation_type="每件", count=count, tapping_mode=default_mode))
     return {"rows": rows, "classification": classification, "evidence": evidence, "programming_hours": programming,
             "fixture_hours": fixture, "grinding_assessment": grinding_reason, "turning_geometry_confidence": geometry_turn_conf}
