@@ -18,9 +18,12 @@ def _capability(config: dict, machine: str) -> dict:
 
 
 def _fits(step: dict, cap: dict) -> bool:
+    """预留压板、夹具与刀具接近空间，不能把刚好塞进行程的零件判为可加工。"""
     dims = sorted(step.get("dimensions", [0, 0, 0]), reverse=True)
     travel = sorted([cap.get("x", 0), cap.get("y", 0), cap.get("z", 0)], reverse=True)
-    return all(a <= b for a, b in zip(dims, travel)) and step.get("net_weight", 0) <= cap.get("max_weight", 0)
+    reserve = [max(30.0, value * 0.05) for value in dims]
+    return (all(value + margin <= available for value, margin, available in zip(dims, reserve, travel))
+            and step.get("net_weight", 0) * 1.10 <= cap.get("max_weight", 0))
 
 
 def _annotate(row: dict, setup: str, direction: str, feature: str, tool: str, detail: str) -> dict:
@@ -43,6 +46,11 @@ def estimate_operations(step: dict, drawing: dict, config: dict, product_type: s
     drawing_turn = drawing_turn or large_thread or rotating_type
     small_valve = max_dim <= 250 and weight <= 10 and drawing_turn
     large_frame = max_dim >= 1500 and weight >= 500
+    # 大型精密板/底座：尺寸接近普通立加极限，且图纸存在精磨或大量孔表。
+    # 条件完全来自尺寸、孔特征与精度要求，不依赖图号或文件名。
+    large_precision_plate = (max_dim >= 1000 and (drawing.get("explicit_grinding")
+                             or drawing.get("grinding_required")
+                             or (max_dim >= 1100 and drawing.get("drilled_count", 0) >= 120)))
     multi_side = bool(drawing.get("side_feature_count", 0) >= 3 and (
         drawing.get("cross_wall_coaxial") or drawing.get("horizontal_deep_holes") or
         any(term in drawing.get("gd_terms", []) for term in ["位置度", "同轴度"])
@@ -67,6 +75,42 @@ def estimate_operations(step: dict, drawing: dict, config: dict, product_type: s
                 _row("钻孔、扩孔、镗孔", primary, holes_time, "2D 孔系与螺纹统计", "中"),
                 _row("换刀、机内测量、去毛刺", primary, 5.0, "大型件检测与辅助", "中")]
         programming, fixture = 12.0, 4.0
+    elif large_precision_plate:
+        classification, primary = "大型精密板件/多孔铸件", "龙门铣"
+        surface_signals = max(8, int(drawing.get("machined_surface_estimate", 0)))
+        hole_count = sum(int(item.get("count", 0)) for item in holes)
+        thread_count = sum(int(item.get("count", 0)) for item in drawing.get("thread_features", []))
+        countersink_count = sum(int(item.get("count", 0)) for item in holes if item.get("countersink") or item.get("counterbore"))
+        hole_groups = max(1, len(holes) + len(drawing.get("thread_features", [])))
+        # 孔加工由每孔定位/切削、沉头、设备刚性攻牙、换刀与大件风险组成。
+        drill_hours = sum(float(item.get("count", 0)) * (0.012 + min(float(item.get("diameter", 0)), 25) * 0.00065) for item in holes if not item.get("countersink"))
+        sink_hours = countersink_count * 0.010
+        tap_hours = sum(float(item.get("count", 0)) * (0.012 + min(float(item.get("nominal_diameter", 0)), 20) * 0.00070) for item in drawing.get("thread_features", []))
+        hole_total = drill_hours + sink_hours + tap_hours + hole_groups * 0.055 + 1.15 + max_dim / 2600
+        # 大平面、正反面、侧向面分别独立装夹；面积/精度只作修正，不按 STEP 面数累加。
+        rough_top = 5.2 + surface_signals * 0.17 + max_dim / 1700
+        finish_top = 4.6 + surface_signals * 0.15 + (0.8 if (drawing.get("min_tolerance") or 1.0) <= 0.05 else 0.3)
+        side_hours = 2.1 + 0.10 * len(drawing.get("datum_references", [])) + min(1.2, hole_count / 400)
+        setup_hours = 0.85 + max_dim / 2200 + (0.20 if weight >= 100 else 0.0)
+        side_machine = "龙门铣" if _capability(config, "龙门铣").get("side_head", False) else "卧式加工中心"
+        evidence += [f"最大尺寸 {max_dim:.0f} mm，预留夹具空间后普通 CNC 不满足；选择龙门铣",
+                     f"PDF 孔表识别 {hole_count} 个孔加工动作、{thread_count} 个螺纹，按数量逐项计时",
+                     "存在精磨/高精度面信号，正反面、侧面和精磨前需分开装夹复核"]
+        rows = [
+            _annotate(_row("OP10 吊装、压板布置与基准打表", primary, setup_hours, "大型毛坯吊装、垫铁、压板与首面基准", "高"), "OP10", "+Z", "底部基准面和支脚面", "吊具/压板/百分表", f"尺寸 {max_dim:.0f} mm；每次装夹含吊装、清理和打表"),
+            _annotate(_row("OP10 正面基准与凸台平面粗精加工", primary, rough_top + finish_top, "加工面数量、平面面积与精度面信号", "中"), "OP10", "+Z", "正面基准、凸台端面和定位面", "面铣刀/立铣刀", f"{surface_signals} 个加工面信号；粗精加工分开走刀"),
+            _annotate(_row("OP20 翻面、背部大平面与支脚面加工", primary, setup_hours + rough_top * 0.70 + finish_top * 0.70, "反面加工方向与翻转重新找正", "高"), "OP20", "-Z", "背部大平面、两个支脚加工面", "吊具/面铣刀", "翻面后重新吊装、定位、开粗和精铣"),
+            _annotate(_row("OP30 侧面孔系与 M20 特征加工", side_machine, setup_hours * 0.70 + side_hours, "侧面加工方向；角度头可由龙门完成，否则转卧加", "中"), "OP30", "+X/-X", "端部立面、侧面 M20 与侧孔", "角度头/钻头/镗刀", "侧向特征单独装夹，含二次找正与侧孔加工"),
+            _annotate(_row("OP10/20 孔系钻削、沉孔、沉头与设备刚性攻牙", primary, hole_total, "孔表的数量、孔径、沉头与螺纹逐项累加", "高"), "OP10/20", "+Z/-Z", "孔表 A-AC 与独立孔特征", "钻头/沉头刀/丝锥", f"钻孔 {drill_hours:.2f}h + 沉头 {sink_hours:.2f}h + 攻牙 {tap_hours:.2f}h + 换刀/试切/大件修正"),
+            _annotate(_row("OP30 去毛刺、清理与尺寸复核", "人工", 0.80 + hole_count * 0.012, "大量孔口、沉头和精度面保护", "中"), "OP30", "检验", "孔口、精度面和装夹基准", "去毛刺工具/量具", f"{hole_count} 个孔加工动作的孔口处理与抽检"),
+        ]
+        for row in rows:
+            row.update({"特征标签": "A–AC" if "孔系" in row["工序"] else "",
+                        "特征类型": "结构化孔表" if "孔系" in row["工序"] else row.get("识别特征", ""),
+                        "规格": "孔表多规格钻孔/沉头/刚性攻牙" if "孔系" in row["工序"] else "",
+                        "数量来源": "PDF孔特征表" if "孔系" in row["工序"] else "STEP尺寸+PDF图纸",
+                        "识别置信度": "高" if "孔系" in row["工序"] else row.get("置信度", "中")})
+        programming, fixture = 3.0 + min(1.0, hole_groups * 0.025), 0.0
     elif small_valve:
         classification, primary = "小型阀体", "CNC加工中心"
         evidence += ["小尺寸阀体", "2D 存在大直径螺纹/密封槽或同轴孔", turn_evidence]
@@ -118,10 +162,11 @@ def estimate_operations(step: dict, drawing: dict, config: dict, product_type: s
         ]
         programming, fixture = 1.6 + section_count * 0.15, 0.35 + surface_count * 0.02
     else:
-        if not cnc_fit and gantry_fit:
-            classification, primary = "大型铣削件", "龙门铣"; evidence.append("超过普通 CNC 行程或承重")
-        elif hmc_fit and (multi_side or product_type == "箱体/多方向孔系"):
+        # 多方向箱体优先卧加；不能因普通立加 Y 轴略不足就先被龙门分支抢走。
+        if hmc_fit and (multi_side or product_type == "箱体/多方向孔系"):
             classification, primary = "箱体/多方向孔系", "卧式加工中心"; evidence.append("多侧孔/镗孔和位置度，同一装夹有优势")
+        elif not cnc_fit and gantry_fit:
+            classification, primary = "大型铣削件", "龙门铣"; evidence.append("超过普通 CNC 行程或承重")
         else:
             classification, primary = "通用铸件/机加工件", "CNC加工中心"; evidence.append("尺寸与重量在普通 CNC 能力范围")
         plane_area = step.get("total_planar_area_m2", 0.0)
@@ -153,9 +198,12 @@ def estimate_operations(step: dict, drawing: dict, config: dict, product_type: s
                          calculation_type="每对产品", count=2, batch_hours=pair_time))
         grinding_reason = f"两件等高：每对磨削 {pair_time:.1f} h，单件分摊 {pair_time/2:.2f} h"
     elif drawing.get("explicit_grinding") or (flat_high and 150 <= max_dim <= 800) or (drawing.get("roughness") and min(drawing["roughness"]) <= 0.8):
-        if _fits(step, _capability(config, "磨床")):
-            h = max(0.4, 0.3 + max_plane*2.0 + (0.2 if flat_high else 0))
-            rows.append(_row("关键平面磨削", "磨床", h, "明确磨削或大平面 0.01 级精度/Ra0.8", "中", "基础", True))
+        if _fits(step, _capability(config, "磨床")) or large_precision_plate:
+            # 大件精磨不能按普通小平面面积公式压成几分钟；长度、精度面数量与重新找正共同决定。
+            h = (min(10.0, max(6.0, 2.6 + max_dim / 420 + max_plane * 1.5))
+                 if large_precision_plate else max(0.4, 0.3 + max_plane*2.0 + (0.2 if flat_high else 0)))
+            basis = "图纸明确精磨；长精度面与 0.01 级平面/平行度需大型平面磨削" if large_precision_plate else "明确磨削或大平面 0.01 级精度/Ra0.8"
+            rows.append(_annotate(_row("关键平面精磨", "磨床", h, basis, "高", "基础", True), "OP40", "+Z/-Z", "阴影精度面/长导轨面", "平面磨砂轮", f"长度 {max_dim:.0f} mm、精度面重新找正和余量磨削"))
             grinding_reason = "关键平面精度超出常规精铣稳定能力，建议磨床"
         else:
             grinding_reason = "存在高精度磨削信号，但尺寸/承重可能超过普通磨床；需人工确认精密龙门或外协大型磨床"
@@ -177,7 +225,7 @@ def estimate_operations(step: dict, drawing: dict, config: dict, product_type: s
     rows.insert(0, _row("CNC编程、首件工艺准备与试切", primary, 0.0, "编程、首件对刀、试切和程序验证", "中", "基础", True,
                         calculation_type="每批一次", batch_hours=programming))
     # 螺纹组必须确认攻牙方式；待确认行默认不进入报价。
-    for group in drawing.get("thread_groups", []):
+    for group in ([] if large_precision_plate else drawing.get("thread_groups", [])):
         diameter, count = group["直径"], group["数量"]
         device_time = 0.012 if diameter <= 6 else (0.018 if diameter <= 12 else 0.030)
         # 底孔加工独立为设备工序；无论后续选人工还是设备攻牙，底孔仍需 CNC/龙门/卧加完成。

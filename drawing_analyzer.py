@@ -20,7 +20,8 @@ def _ocr_pdf(file_bytes: bytes) -> str:
         from pdf2image import convert_from_bytes
         import pytesseract
         pages = convert_from_bytes(file_bytes, dpi=250)
-        return "\n".join(pytesseract.image_to_string(page, lang="chi_sim+eng") for page in pages)
+        # 同时启用简体、繁体和英文，标题栏公司名经常是繁体中文。
+        return "\n".join(pytesseract.image_to_string(page, lang="chi_sim+chi_tra+eng") for page in pages)
     except Exception:
         return ""
 
@@ -28,10 +29,13 @@ def _ocr_pdf(file_bytes: bytes) -> str:
 def extract_pdf(file_bytes: bytes, filename: str) -> tuple[dict, str, bool]:
     text = "\n".join(page.extract_text() or "" for page in PdfReader(BytesIO(file_bytes)).pages)
     used_ocr = False
-    if len(re.sub(r"\s+", "", text)) < 20:
+    # 有些中文 CAD 字体能提取到字符但出现乱码；这时仍要尝试 OCR，不能把乱码当公司名。
+    damaged_text = "�" in text or text.count("\ufffd") > 0
+    if len(re.sub(r"\s+", "", text)) < 20 or damaged_text:
         ocr_text = _ocr_pdf(file_bytes)
         if ocr_text:
-            text, used_ocr = ocr_text, True
+            text = text + "\n" + ocr_text
+            used_ocr = True
     return extract_fields(text, filename), text, used_ocr
 
 
@@ -275,3 +279,179 @@ def analyze_drawing(text: str) -> dict:
 
 def _number_or_none(value: str | None) -> float | None:
     return float(value) if value else None
+
+
+# 保留上方的兼容解析器；以下包装层为标题栏、结构化孔表和工程备注提供更可靠的数据源。
+_base_analyze_drawing = analyze_drawing
+_base_extract_fields = extract_fields
+
+
+def _title_block_fields(text: str, filename: str = "") -> dict:
+    """从标题栏文本识别中英文公司、图名和图号，并保留来源/置信度。"""
+    result = _base_extract_fields(text, filename)
+    lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines() if line.strip()]
+    chinese_companies = []
+    english_companies = []
+    for line in lines:
+        if re.search(r"(?:公司|科技有限公司|有限责任公司|股份有限公司)", line) and len(line) <= 80:
+            chinese_companies.append(line)
+        if re.search(r"\b(?:COMPANY|CO\.?|LIMITED|INC\.?|LTD\.?)\b", line, re.I) and len(line) <= 100:
+            english_companies.append(line)
+    if chinese_companies:
+        result["company_name"] = max(chinese_companies, key=len)
+        result["company_name_source"] = "PDF标题栏/公司行"; result["company_name_confidence"] = "高"
+    if english_companies:
+        result["english_company_name"] = max(english_companies, key=len)
+    # 图号通常比图名多一个或多个以连字符分隔的版本段；优先寻找具有前缀关系的两段型号。
+    codes = []
+    for token in re.findall(r"\b[A-Z][A-Z0-9]*(?:-[A-Z0-9]+){1,}\b", text.upper()):
+        if token not in codes and not token.startswith(("GB-", "ISO-", "GW-")):
+            codes.append(token)
+    parent_child = [(longer, shorter) for longer in codes for shorter in codes
+                    if longer != shorter and longer.startswith(shorter + "-")]
+    if parent_child:
+        drawing_number, product_name = max(parent_child, key=lambda item: (item[0].count("-"), len(item[0])))
+        result.update({"drawing_number": drawing_number, "product_number": drawing_number, "product_name": product_name,
+                       "part_number": product_name, "identification_source": "PDF右下角标题栏型号组合", "identification_confidence": "高"})
+    else:
+        result.setdefault("identification_source", "文件名备用")
+        result.setdefault("identification_confidence", "需要人工确认")
+    return result
+
+
+def extract_fields(text: str, filename: str = "") -> dict:
+    return _title_block_fields(text, filename)
+
+
+def _parse_hole_table(text: str) -> list[dict]:
+    """解析“标签 / 大小或加工要求 / 数量”式多行孔表，数量继承给该标签全部加工步骤。"""
+    lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines() if line.strip()]
+    start = next((i for i, line in enumerate(lines) if "标签" in line and "数量" in line), None)
+    if start is None:
+        return []
+    table_lines = lines[start + 1:start + 100]
+    rows, current_label, bucket = [], None, []
+    label_re = re.compile(r"^(AA|AC|[A-Z])(?:\s+|$)(.*)$")
+    def flush() -> None:
+        if not current_label or not bucket:
+            return
+        source = " ".join(bucket)
+        thread = re.search(r"M\s*(\d+(?:\.\d+)?)\s*[-×x]?\s*(6[Hh]|[Hh]\d)?", source)
+        # 数量是该标签最后一条工艺说明的末尾整数；排除90°、孔径和深度。
+        terminal = re.findall(r"(?<![.\d])(\d+)(?![.\d])", bucket[-1])
+        quantity = int(terminal[-1]) if terminal else 0
+        if quantity <= 0 or quantity > 10000:
+            return
+        # 螺纹标称直径（例如 M5）不是底孔直径；先移除 M 规格再取首个数值。
+        numeric_source = re.sub(r"M\s*\d+(?:\.\d+)?\s*[-×x]?\s*(?:6[Hh]|[Hh]\d)?", "", source)
+        numbers = re.findall(r"\d+(?:\.\d+)?", numeric_source)
+        base_diameter = None
+        if numbers:
+            candidates = [float(value) for value in numbers if 0.5 <= float(value) <= 200]
+            if candidates:
+                # 螺纹行往往先列螺纹深度再列底孔直径；以常用底孔约为公称直径 0.8 倍
+                # 选择最接近值，避免把“深10”当成 M5 的 Ø10 底孔。
+                candidate = (min(candidates, key=lambda value: abs(value - float(thread.group(1)) * 0.82))
+                             if thread else candidates[0])
+                base_diameter = candidate
+        countersink = re.search(r"(\d+(?:\.\d+)?)\s*[×xX]\s*90°", source)
+        row = {"label": current_label, "quantity": quantity, "base_diameter": base_diameter,
+               "thread_spec": (f"M{thread.group(1)}" + (f"-{thread.group(2).upper()}" if thread.group(2) else "")) if thread else None,
+               "thread_diameter": float(thread.group(1)) if thread else None,
+               "countersink_diameter": float(countersink.group(1)) if countersink else None,
+               "through": "贯穿" in source or "THRU" in source.upper(), "source_text": source,
+               "source": "PDF孔特征表", "confidence": "高"}
+        # 视图索引中的“N 1”“P 1”并不是孔表记录。孤立数字没有孔径/螺纹/沉头
+        # 说明时不自动计入报价，避免把图框坐标误识别成 Ø1 孔。
+        has_process_detail = row["thread_spec"] or row["countersink_diameter"] or len(numbers) >= 2
+        if has_process_detail and (row["base_diameter"] or row["thread_spec"] or row["countersink_diameter"]):
+            rows.append(row)
+    for line in table_lines:
+        # 孔表结束后经常紧跟视图索引（只有一个字母）。AC 这类标签也可能独占一行，
+        # 所以仅在已有完整记录且上一行只是数量时结束。
+        if (current_label and line not in {"AA", "AC"} and re.fullmatch(r"[A-Z]{1,2}", line)
+                and bucket and re.fullmatch(r"\d+", bucket[-1].strip())):
+            flush()
+            current_label, bucket = None, []
+            break
+        match = label_re.match(line)
+        if match:
+            flush(); current_label, bucket = match.group(1), [match.group(2)]
+        elif current_label:
+            # 标题栏开始后结束，避免把整张图的编号继续拼到最后一个孔标签。
+            if any(marker in line.upper() for marker in ["TITLE", "DWG NO", "TECHNICAL", "图纸号", "技术要求"]):
+                break
+            bucket.append(line)
+    flush()
+    return rows
+
+
+def _independent_thread_annotations(text: str) -> list[dict]:
+    """识别孔表外由尺寸引线给出数量的螺纹，例如上一行“2×Ø17.5”后的 M20-6H。
+
+    只有紧邻的数量引线才会加入，孤立 M20 仍保留为待人工确认，避免把说明编号当孔。
+    """
+    lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines() if line.strip()]
+    result = []
+    thread_re = re.compile(r"\bM\s*(\d+(?:\.\d+)?)\s*(?:[-×x]\s*(\d[HhGg]))?", re.I)
+    label_re = re.compile(r"^(?:AA|AC|[A-Z])(?:\s+|$)")
+    for index, line in enumerate(lines):
+        match = thread_re.search(line)
+        if not match or label_re.match(line):
+            continue
+        previous = lines[index - 1] if index else ""
+        count_match = re.search(r"\b(\d+)\s*[×xX]\s*(?:[ØΦφ]?\s*\d)", previous)
+        if not count_match:
+            continue
+        count = int(count_match.group(1))
+        spec = f"M{match.group(1)}" + (f"-{match.group(2).upper()}" if match.group(2) else "")
+        result.append({"specification": spec, "nominal_diameter": float(match.group(1)), "count": count,
+                       "source_text": previous + " / " + line, "confidence": "中", "label": "独立引线",
+                       "source": "PDF尺寸引线"})
+    return result
+
+
+def analyze_drawing(text: str) -> dict:
+    result = _base_analyze_drawing(text)
+    table_rows = _parse_hole_table(text)
+    if table_rows:
+        threads, holes = [], []
+        for row in table_rows:
+            quantity = row["quantity"]
+            if row["thread_spec"]:
+                threads.append({"specification": row["thread_spec"], "nominal_diameter": row["thread_diameter"],
+                                "pitch": None, "tolerance_class": "6H" if "-6H" in row["thread_spec"] else None,
+                                "count": quantity, "depth": None, "through": False, "source_text": row["source_text"],
+                                "confidence": "高", "label": row["label"], "source": row["source"]})
+            if row["base_diameter"]:
+                holes.append({"diameter": row["base_diameter"], "count": quantity, "depth": None,
+                              "through": row["through"], "countersink": False, "counterbore": False, "reamed": False,
+                              "tolerance": None, "source_text": row["source_text"], "confidence": "高",
+                              "label": row["label"], "source": row["source"]})
+            if row["countersink_diameter"]:
+                holes.append({"diameter": row["countersink_diameter"], "count": quantity, "depth": None,
+                              "through": False, "countersink": True, "counterbore": False, "reamed": False,
+                              "tolerance": None, "source_text": row["source_text"], "confidence": "高",
+                              "label": row["label"], "source": row["source"]})
+        # 孔表是主要来源；孔表外、带明确数量引线的螺纹（如侧面 M20）补入，
+        # 不把主视图的 A/B/C 标签重复累加。
+        for feature in _independent_thread_annotations(text):
+            threads.append({"specification": feature["specification"], "nominal_diameter": feature["nominal_diameter"],
+                            "pitch": None, "tolerance_class": "6H" if "-6H" in feature["specification"] else None,
+                            "count": feature["count"], "depth": None, "through": False, "source_text": feature["source_text"],
+                            "confidence": feature["confidence"], "label": feature["label"], "source": feature["source"]})
+        result["thread_features"] = threads
+        result["hole_features"] = holes
+        result["threaded_count"] = sum(item["count"] for item in threads)
+        result["drilled_count"] = sum(item["count"] for item in holes)
+        result["thread_diameters"] = [item["nominal_diameter"] for item in threads]
+        result["thread_groups"] = [{"规格": item["specification"], "数量": item["count"], "直径": item["nominal_diameter"],
+                                    "标签": item["label"], "数量来源": item["source"], "置信度": item["confidence"]} for item in threads]
+    normalized = result.get("normalized_text", text)
+    explicit_grinding = bool(re.search(r"精磨|磨削|磨床|研磨", normalized, re.I))
+    tolerance_signals = [0.01] if "精磨" in normalized else []
+    result["explicit_grinding"] = result.get("explicit_grinding", False) or explicit_grinding
+    result["grinding_required"] = result["explicit_grinding"] or any(value <= 0.02 for value in result.get("geometric_values", []) + tolerance_signals)
+    result["grinding_reason"] = "图纸明确要求精磨" if "精磨" in normalized else "未检测到强制磨削文字"
+    result["hole_table_rows"] = table_rows
+    return result

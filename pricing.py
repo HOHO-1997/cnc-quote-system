@@ -67,13 +67,23 @@ def _operation_schedule(row: dict, product_quantity: int, rate_map: dict, manual
     elif kind == "每批一次": equipment_h = batch_h or unit_h
     elif kind == "每对产品": equipment_h = math.ceil(product_quantity / 2) * (batch_h or unit_h * 2)
     elif kind == "手动总价": pass
+    # 去毛刺、检验、清理、装配等普通人工工序不能被错误计为“未知设备”。
+    # 统一转入人工工时和人工费，设备占机时间保持为 0。
+    is_manual_operation = (not is_tapping and equipment in {"人工", "人工工位"})
+    if is_manual_operation:
+        labor_h, equipment_h = labor_h + equipment_h, 0.0
     manual_total = _number(row.get("手动总价(元)", 0.0)) if kind == "手动总价" else 0.0
     billing_equipment = tapping_machine if is_tapping and mode != "人工攻牙" else equipment
     equipment_amount = equipment_h * float(rate_map.get(billing_equipment, manual_rate))
     labor_amount = labor_h * manual_rate
     # 人工攻牙必须在报价表中明确显示“人工工位”，不能误导为 CNC 占机。
-    display_equipment = "人工工位" if is_tapping and mode == "人工攻牙" else billing_equipment
-    return {"工序": row.get("工序"), "计算类型": kind, "执行方式": mode if is_tapping else "设备加工", "设备": display_equipment, "数量": operation_count, "单孔时间(h)": unit_h if is_tapping else 0.0, "单件时间(h)": adjusted_unit_h if not is_tapping else unit_h * operation_count,
+    display_equipment = "人工工位" if (is_manual_operation or (is_tapping and mode == "人工攻牙")) else billing_equipment
+    return {"工序": row.get("工序"), "特征标签": row.get("特征标签", row.get("标签", "")),
+            "特征类型": row.get("特征类型", row.get("识别特征", "")), "规格": row.get("规格", ""),
+            "数量来源": row.get("数量来源", "自动工艺估算"), "识别置信度": row.get("识别置信度", row.get("置信度", "")),
+            "装夹编号": row.get("装夹编号", ""), "加工方向": row.get("加工方向", ""), "刀具类型": row.get("刀具类型", ""),
+            "切削/时间依据": row.get("时间计算依据", row.get("判断依据", "")),
+            "执行方式": mode if is_tapping else "设备加工", "计算类型": kind, "设备": display_equipment, "数量": operation_count, "单孔时间(h)": unit_h if is_tapping else 0.0, "单件时间(h)": adjusted_unit_h if not is_tapping else unit_h * operation_count,
             "每批时间(h)": batch_h, "整批设备时间(h)": equipment_h, "整批人工时间(h)": labor_h,
             "单价(元/h)": manual_rate if display_equipment == "人工工位" else float(rate_map.get(billing_equipment, manual_rate)), "人工单价(元/h)": manual_rate,
             "整批金额(元)": equipment_amount + labor_amount + manual_total, "设备金额(元)": equipment_amount,

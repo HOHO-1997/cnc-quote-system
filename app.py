@@ -226,7 +226,13 @@ def pricing_page(config: dict) -> None:
         if restored:
             st.session_state["confirmed_operations"] = rows
             st.warning("检测到确认数据遗漏了自动识别的基础设备工序，已补回粗加工、精加工、钻孔等基础工序；请复核后保存报价。")
-        data = {"customer": customer, "product_name": product_name, "product_number": product_number, "quantity": quantity, "product_type": product_type,
+        data = {"customer": customer, "product_name": product_name, "product_number": product_number,
+                # 标题栏字段与用户可编辑的报价字段并存：PDF 标题栏优先，文件名仅是备用来源。
+                "company_name": fields.get("company_name", ""), "english_company_name": fields.get("english_company_name", ""),
+                "drawing_number": fields.get("drawing_number", product_number), "part_number": fields.get("part_number", ""),
+                "identification_source": fields.get("identification_source", "需要人工确认"),
+                "identification_confidence": fields.get("identification_confidence", "低"),
+                "quantity": quantity, "product_type": product_type,
                 "fixture_count": fixture_count, "sample_quantity": sample_quantity, "tier_rows": tier_editor.to_dict("records"), "material": material, "net_weight": net_weight, "casting_weight": casting_weight, "quote_mode": quote_mode,
                 "casting_sales_rate": sale_rate, "packaging_mode": packaging_mode, "packaging_cost": packaging_cost, "surface_area_m2": step.get("total_planar_area_m2", 0.0), "surfaces": surfaces.to_dict("records")}
         result = calculate_quote(data, rows, config, additional.to_dict("records"), surfaces.to_dict("records"))
@@ -285,7 +291,10 @@ def pricing_page(config: dict) -> None:
     with st.expander("工序详情", expanded=False):
         st.dataframe(pd.DataFrame(brief_processes), use_container_width=True, hide_index=True)
         with st.expander("工程计算详情", expanded=False):
-            detailed = [{"工序": item["工序"], "执行方式": item.get("执行方式", ""), "计算类型": item["计算类型"], "设备/人工": item["设备"], "数量": item["数量"],
+            detailed = [{"工序": item["工序"], "特征标签": item.get("特征标签", ""), "特征类型": item.get("特征类型", ""), "规格": item.get("规格", ""),
+                         "数量来源": item.get("数量来源", ""), "识别置信度": item.get("识别置信度", ""), "装夹编号": item.get("装夹编号", ""),
+                         "加工方向": item.get("加工方向", ""), "刀具类型": item.get("刀具类型", ""), "时间计算依据": item.get("切削/时间依据", ""),
+                         "执行方式": item.get("执行方式", ""), "计算类型": item["计算类型"], "设备/人工": item["设备"], "数量": item["数量"],
                          "单孔时间(h)": item.get("单孔时间(h)", 0), "单件时间(h)": item["单件时间(h)"], "每批时间(h)": item["每批时间(h)"],
                          "整批设备时间(h)": item["整批设备时间(h)"], "整批人工时间(h)": item["整批人工时间(h)"], "单价(元/h)": item["单价(元/h)"],
                          "整批金额(元)": item["整批金额(元)"], "判断依据": item["判断依据"]} for item in result.get("operation_schedules", [])]
