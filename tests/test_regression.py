@@ -241,9 +241,15 @@ X200AS-002-501 X200AS-002
         self.assertEqual(fields["product_name"], "X200AS-002")
         self.assertEqual(fields["drawing_number"], "X200AS-002-501")
         result = estimate_operations(step([1150, 770, 80], 57, 68, 0.85), drawing, DEFAULT_CONFIG)
-        gantry = sum(row["单件时间(h)"] for row in result["rows"] if row["推荐设备"] == "龙门铣")
-        grinding = sum(row["单件时间(h)"] for row in result["rows"] if row["推荐设备"] == "磨床")
+        quote = calculate_quote({"quantity": 1, "material": "灰铁", "net_weight": 57, "casting_weight": 68,
+                                 "quote_mode": "成本加利润", "packaging_mode": "单件费用"}, result["rows"], DEFAULT_CONFIG, [], [])
+        gantry = sum(row["整批设备时间(h)"] for row in quote["operation_schedules"] if row["设备"] == "龙门铣")
+        grinding = sum(row["整批设备时间(h)"] for row in quote["operation_schedules"] if row["设备"] == "磨床")
         self.assertEqual(result["classification"], "大型精密板件/多孔铸件")
+        tapping = [row for row in result["rows"] if "螺纹加工" in row["工序"]]
+        self.assertTrue(tapping)
+        self.assertTrue(all(row["攻牙方式"] == "设备刚性攻牙" for row in tapping))
+        self.assertTrue(all(row["推荐设备"] == "龙门铣" for row in tapping))
         self.assertGreaterEqual(gantry, 28)
         self.assertLessEqual(gantry, 36)
         self.assertGreaterEqual(grinding, 6)
