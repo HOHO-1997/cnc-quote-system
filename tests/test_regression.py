@@ -255,6 +255,60 @@ X200AS-002-501 X200AS-002
         self.assertGreaterEqual(grinding, 6)
         self.assertLessEqual(grinding, 10)
 
+    def test_coordinate_hole_table_inherits_specs_and_precision_plate_route(self):
+        # Coordinate-table rows carry X/Y only.  The M specification is a
+        # merged cell and must be inherited by the following label rows.
+        text = """13×Ø2.50 7.50
+M3-6H 6
+10×Ø6.80 19.75
+M8-6H 16
+阴影部分为精度面，要求研磨；两面加工
+标签 ×位置 Y位置 大小
+B1 10 36
+3.30 10.10
+M4-6H 8
+B2 10 543
+B3 30 16
+Y1 91 526.50 M3-6H 6
+2.50 7.50
+Y2 91 576.50 M3-6H 6
+2.50 7.50
+AA1 119.50 55 4.20 12.40
+M5-6H 10
+AA2 119.50 445 4.20 12.40
+M5-6H 10
+H1 297 509.50 M6-6H 12
+5 15
+H2 327 509.50 M6-6H 12
+5 15
+"""
+        drawing = analyze_drawing(text)
+        counts = {item["规格"]: item["数量"] for item in drawing["thread_groups"]}
+        self.assertEqual(counts["M4-6H"], 3)
+        self.assertEqual(counts["M3-6H"], 15)  # Y1/Y2 plus 13-view call-out
+        self.assertEqual(counts["M5-6H"], 2)
+        self.assertEqual(counts["M6-6H"], 2)
+        self.assertEqual(counts["M8-6H"], 10)
+        self.assertTrue(drawing["two_sided_required"])
+        self.assertTrue(drawing["grinding_required"])
+
+        # The routing trigger is size + precision/grinding + hole volume, not
+        # a file name.  It produces separate face/flip/side/grinding routes.
+        drawing["drilled_count"] = 80
+        result = estimate_operations(step([774, 640, 45], 75, 90, 0.30), drawing, DEFAULT_CONFIG)
+        rows = result["rows"]
+        setups = {row.get("装夹编号") for row in rows if row.get("装夹编号")}
+        self.assertTrue({"OP10", "OP20", "OP30"}.issubset(setups))
+        self.assertTrue(any(row["推荐设备"] == "磨床" for row in rows))
+        self.assertTrue(all(row["攻牙方式"] == "设备刚性攻牙" for row in rows if "螺纹加工" in row["工序"]))
+        quote = calculate_quote({"quantity": 1, "material": "灰铁", "net_weight": 75, "casting_weight": 90,
+                                 "quote_mode": "成本加利润", "packaging_mode": "单件费用"}, rows, DEFAULT_CONFIG, [], [])
+        self.assertGreaterEqual(quote["batch_equipment_time"], 18)
+        self.assertLessEqual(quote["batch_equipment_time"], 25)
+        self.assertGreaterEqual(quote["equipment_per_unit"], 3300)
+        self.assertLessEqual(quote["equipment_per_unit"], 4300)
+        self.assertTrue(quote["amount_validation"]["valid"])
+
 
 if __name__ == "__main__":
     unittest.main()
