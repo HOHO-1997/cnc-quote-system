@@ -309,6 +309,16 @@ H2 327 509.50 M6-6H 12
         self.assertLessEqual(quote["equipment_per_unit"], 4300)
         self.assertTrue(quote["amount_validation"]["valid"])
 
+    def test_black_zinc_and_baked_paint_are_detected_and_priced(self):
+        drawing = analyze_drawing("表面处理：镀黑锌后烤漆，精加工面保护")
+        self.assertIn("镀黑锌", drawing["surface_processes"])
+        self.assertIn("烤漆", drawing["surface_processes"])
+        rows = [{"启用": True, "名称": "镀黑锌", "计价方式": "按kg", "单价": 8.0, "最低收费": 0.0},
+                {"启用": True, "名称": "烤漆", "计价方式": "按kg", "单价": 2.0, "最低收费": 0.0}]
+        quote = calculate_quote({"quantity": 1, "material": "灰铁", "net_weight": 5, "casting_weight": 6,
+                                 "quote_mode": "成本加利润", "packaging_mode": "单件费用"}, [], DEFAULT_CONFIG, [], rows)
+        self.assertAlmostEqual(quote["surface_per_unit"], 50.0)
+
 
 if __name__ == "__main__":
     unittest.main()
