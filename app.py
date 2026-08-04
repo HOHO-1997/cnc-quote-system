@@ -6,7 +6,7 @@ import streamlit as st
 
 from config import load_config, save_config
 from database import calibration, history, init_database, save_quote, update_actual
-from drawing_analyzer import analyze_drawing, extract_dxf, extract_pdf
+from drawing_analyzer import analyze_drawing, extract_dxf, extract_pdf, title_block_preview
 from export import quote_excel
 from machining_estimator import estimate_operations
 from pricing import calculate_quote
@@ -44,6 +44,7 @@ def drawing_and_step_panel(config: dict, product_type: str = "自动识别") -> 
                 fields, text, used_ocr = extract_pdf(pdf.getvalue(), pdf.name)
                 st.session_state["drawing"] = analyze_drawing(text)
                 st.session_state["fields"] = fields
+                st.session_state["title_block_preview"] = title_block_preview(pdf.getvalue())
                 st.success("PDF 已解析" + ("（已启用 OCR）" if used_ocr else ""))
             except Exception as e: st.error(f"PDF 读取失败：{e}")
         if dxf and st.button("读取 DXF 图纸"):
@@ -67,6 +68,22 @@ def drawing_and_step_panel(config: dict, product_type: str = "自动识别") -> 
     drawing, step = st.session_state.get("drawing", {}), st.session_state.get("step", {})
     if drawing:
         st.caption(f"图纸识别：螺纹约 {drawing.get('threaded_count', 0)} 个；成组孔约 {drawing.get('drilled_count', 0)} 个；材料/热处理/测试信号均需复核。")
+        fields = st.session_state.get("fields", {})
+        with st.expander("标题栏识别复核", expanded=False):
+            st.dataframe(pd.DataFrame([{
+                "中文公司名称": fields.get("company_name", "需要人工确认"),
+                "英文公司名称": fields.get("english_company_name", ""),
+                "产品名称": fields.get("product_name", "需要人工确认"),
+                "图纸号": fields.get("drawing_number", "需要人工确认"),
+                "零件号": fields.get("part_number", ""),
+                "来源": fields.get("identification_source", ""),
+                "置信度": fields.get("identification_confidence", "需要人工确认"),
+            }]), use_container_width=True, hide_index=True)
+            preview = st.session_state.get("title_block_preview")
+            if preview:
+                st.image(preview, caption="PDF 第一页右下角标题栏截取：请核对公司、产品和图纸号")
+            else:
+                st.caption("当前部署环境未生成标题栏预览；仍可根据上方来源和置信度人工复核。")
     if step.get("available"):
         dims = step["dimensions"]
         st.info(f"STEP 成品净重 {step['net_weight']:.2f} kg；外形 {dims[0]:.0f} × {dims[1]:.0f} × {dims[2]:.0f} mm；最大平面 {step['largest_planar_area_m2']:.3f} m²。")
@@ -240,12 +257,17 @@ def pricing_page(config: dict) -> None:
         if result["final_billed_operation_count"] < result["enabled_operation_count"]:
             st.error(f"计价工序异常：启用 {result['enabled_operation_count']} 项，但最终仅计价 {result['final_billed_operation_count']} 项。已阻止生成报价，请重新确认工序。")
             return
+        if not result.get("amount_validation", {}).get("valid", False):
+            st.error("报价金额汇总校验未通过：工序、一次性费用或总成本存在不一致，已阻止生成报价和导出。")
+            return
         st.session_state["tier_rows"] = data["tier_rows"]
         st.session_state["quote"] = (data, result, additional.to_dict("records"))
     if "quote" not in st.session_state: return
     data, result, _ = st.session_state["quote"]
     st.subheader("报价总览")
     st.caption(f"自动识别工序数：{result.get('auto_identified_operation_count', result['input_operation_count'])}；确认工序数：{len(result['confirmed_rows'])}；启用工序数：{result['enabled_operation_count']}；最终计价工序数：{result['final_billed_operation_count']}。")
+    check = result.get("amount_validation", {})
+    st.caption(f"金额校验通过：工序金额 ¥{check.get('schedule_amount', 0):,.2f} = 设备＋人工＋手动金额 ¥{check.get('schedule_components', 0):,.2f}；总成本重算一致。")
     st.caption("打样与批量报价使用不同的数量分摊一次性费用；未确认的精度/检验或攻牙工序不会计入报价。")
     cal = calibration(data["product_type"])
     formula_time = result["base_time"] + result["extra_time"]

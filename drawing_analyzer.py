@@ -26,6 +26,23 @@ def _ocr_pdf(file_bytes: bytes) -> str:
         return ""
 
 
+def title_block_preview(file_bytes: bytes) -> bytes | None:
+    """Return the bottom-right title-block crop for human verification.
+
+    This is a visual aid only: all machine extraction remains text/table based.
+    It intentionally fails quietly on deployments without Poppler.
+    """
+    try:
+        from pdf2image import convert_from_bytes
+        image = convert_from_bytes(file_bytes, dpi=160, first_page=1, last_page=1)[0]
+        width, height = image.size
+        crop = image.crop((int(width * 0.48), int(height * 0.56), width, height))
+        output = BytesIO(); crop.save(output, format="PNG")
+        return output.getvalue()
+    except Exception:
+        return None
+
+
 def extract_pdf(file_bytes: bytes, filename: str) -> tuple[dict, str, bool]:
     text = "\n".join(page.extract_text() or "" for page in PdfReader(BytesIO(file_bytes)).pages)
     used_ocr = False
@@ -301,7 +318,13 @@ def _title_block_fields(text: str, filename: str = "") -> dict:
     company_lines = ocr_lines or lines
     chinese_companies = []
     english_companies = []
+    pollution = re.compile(r"\b(?:RGB|SURFACE\s*FINISH|HEAT[ -]?TREAT|MATERIAL|QTY\.?|DATE|DRAWN|CHECKED|DESIGNED|APPROVED)\b|制图|审核|设计|日期", re.I)
     for line in company_lines:
+        # A title-block row may visually sit beside surface finish/date cells;
+        # OCR sometimes reads the whole row as one line.  Such a mixed line is
+        # not a company name and must be discarded instead of saved as client.
+        if pollution.search(line):
+            continue
         # 含替换字符的 CAD 字体乱码不应作为公司名；OCR 成功后会提供可读中文行。
         if "�" not in line and re.search(r"(?:公司|科技有限公司|有限责任公司|股份有限公司)", line) and len(line) <= 80:
             chinese_companies.append(line)
@@ -322,7 +345,8 @@ def _title_block_fields(text: str, filename: str = "") -> dict:
     if parent_child:
         drawing_number, product_name = max(parent_child, key=lambda item: (item[0].count("-"), len(item[0])))
         result.update({"drawing_number": drawing_number, "product_number": drawing_number, "product_name": product_name,
-                       "part_number": product_name, "identification_source": "PDF右下角标题栏型号组合", "identification_confidence": "高"})
+                       # “Parts No.” 单元格为空时不能把图名复制进去，避免客户误以为已识别到零件号。
+                       "part_number": "", "identification_source": "PDF右下角标题栏型号组合", "identification_confidence": "高"})
     else:
         result.setdefault("identification_source", "文件名备用")
         result.setdefault("identification_confidence", "需要人工确认")
@@ -334,6 +358,13 @@ def _title_block_fields(text: str, filename: str = "") -> dict:
             result["customer"] = customer_candidate
             result["customer_source"] = result.get("company_name_source", "PDF标题栏")
             result["customer_confidence"] = result.get("company_name_confidence", "中")
+    # This small evidence block is rendered by the app/export and gives the
+    # engineer an auditable title-block source without mixing field contents.
+    result["title_block_evidence"] = {
+        "source": "OCR标题栏" if ocr_lines else "PDF标题栏文本",
+        "confidence": result.get("identification_confidence", "需要人工确认"),
+        "excerpt": " | ".join(company_lines[:12]),
+    }
     return result
 
 
@@ -472,4 +503,176 @@ def analyze_drawing(text: str) -> dict:
     result["grinding_required"] = result["explicit_grinding"] or any(value <= 0.02 for value in result.get("geometric_values", []) + tolerance_signals)
     result["grinding_reason"] = "图纸明确要求精磨" if "精磨" in normalized else "未检测到强制磨削文字"
     result["hole_table_rows"] = table_rows
+    return result
+
+
+# Some suppliers use a coordinate table instead of a conventional
+# "label/specification/quantity" table.  Each physical hole is one table row
+# (A1, A2, ...), while the specification cell is often merged vertically.  A
+# plain full-text regex sees the M3/M4 text but loses the number of labelled
+# rows, which is why the former version quoted every hole as one piece.
+_analyze_before_coordinate_table = analyze_drawing
+
+
+def _coordinate_hole_table(text: str) -> list[dict]:
+    """Read generic ``label / X / Y / specification`` coordinate tables.
+
+    The algorithm deliberately uses label sequence and a vertically inherited
+    specification; it does not know, or depend on, any drawing number.
+    """
+    lines = [re.sub(r"\s+", " ", line).strip() for line in normalize_engineering_text(text).splitlines() if line.strip()]
+    # Some CAD PDF fonts extract the X heading as multiplication sign, so the
+    # stable header signal is "标签 + 位置 + Y", rather than a literal X.
+    starts = [i for i, line in enumerate(lines)
+              if "标签" in line and "位置" in line and "Y" in line.upper()]
+    if not starts:
+        return []
+
+    label_re = re.compile(r"^(?P<prefix>AA|AB|AC|[A-Z])(?P<index>\d+)\s+(?P<x>-?\d+(?:\.\d+)?)\s+(?P<y>-?\d+(?:\.\d+)?)(?P<tail>.*)$", re.I)
+    records: list[dict] = []
+    active: dict[str, dict] = {}
+    current: dict | None = None
+
+    def spec_from(parts: list[str]) -> dict:
+        body = " ".join(parts)
+        thread = re.search(r"\bM\s*(\d+(?:\.\d+)?)(?:\s*[×x]\s*(\d+(?:\.\d+)?))?\s*-?\s*(6[Hh])?", body)
+        # Coordinates are not dimensions.  Only the text below/alongside the
+        # label is allowed to become a bottom-hole diameter.
+        dims = re.findall(r"(?:Ø|\u2205)\s*(\d+(?:\.\d+)?)|(?<![A-Z0-9.])(\d+(?:\.\d+)?)(?=\s+(?:\d+(?:\.\d+)?\s*)?(?:M\s*\d|$))", body, re.I)
+        numbers = [float(a or b) for a, b in dims if (a or b)]
+        before_thread = body[:thread.start()] if thread else body
+        plain = [float(v) for v in re.findall(r"(?<![A-Z0-9.])(\d+(?:\.\d+)?)", before_thread)]
+        base = None
+        if thread:
+            nominal = float(thread.group(1))
+            candidates = [v for v in (numbers or plain) if 0.5 <= v < nominal]
+            if candidates:
+                base = min(candidates, key=lambda v: abs(v - nominal * 0.82))
+        elif numbers:
+            base = numbers[0]
+        countersink = re.search(r"(?:Ø|\u2205)?\s*(\d+(?:\.\d+)?)\s*[×x]\s*90", body, re.I)
+        return {
+            "thread_spec": (f"M{thread.group(1)}" + (f"×{thread.group(2)}" if thread and thread.group(2) else "")
+                            + ("-6H" if thread and thread.group(3) else "")) if thread else None,
+            "thread_diameter": float(thread.group(1)) if thread else None,
+            "base_diameter": base,
+            "countersink_diameter": float(countersink.group(1)) if countersink else None,
+            "source_text": body,
+        }
+
+    def flush() -> None:
+        nonlocal current
+        if not current:
+            return
+        parsed = spec_from(current.pop("parts"))
+        prefix = current["label_prefix"]
+        if parsed["thread_spec"] or parsed["base_diameter"] or parsed["countersink_diameter"]:
+            active[prefix] = parsed
+        else:
+            parsed = active.get(prefix, parsed)
+        records.append({**current, **parsed, "quantity": 1,
+                        "source": "PDF坐标孔表", "confidence": "高"})
+        current = None
+
+    for start in starts:
+        # Stop at the next title/notes block.  600 lines is enough for a dense
+        # coordinate table and avoids accidentally reading a later sheet.
+        for line in lines[start + 1:start + 600]:
+            if current and "标签" in line and "位置" in line and "Y" in line.upper():
+                # Multi-column tables repeat the header.  Close the current
+                # record and let the next header start parse the next column.
+                flush()
+                break
+            match = label_re.match(line)
+            if match:
+                flush()
+                current = {"label": f"{match.group('prefix').upper()}{match.group('index')}",
+                           "label_prefix": match.group("prefix").upper(),
+                           "x": float(match.group("x")), "y": float(match.group("y")),
+                           "parts": [match.group("tail").strip()]}
+                continue
+            if current:
+                # A new drawing/table title marks the end; ordinary dimension
+                # lines belong to the currently open table record.
+                if re.search(r"\b(?:TITLE|DWG\s*NO|SHEET)\b|技术要求|MATERIAL\s*SPEC", line, re.I):
+                    flush()
+                    break
+                current["parts"].append(line)
+        flush()
+    return records
+
+
+def _explicit_view_thread_groups(text: str) -> list[dict]:
+    """Count explicit first-page annotations, but never coordinate labels."""
+    engineering = normalize_engineering_text(text)
+    table_at = engineering.find("标签")
+    view_text = engineering if table_at < 0 else engineering[:table_at]
+    lines = [line.strip() for line in view_text.splitlines() if line.strip()]
+    groups: list[dict] = []
+    previous = ""
+    for line in lines:
+        thread = re.search(r"\bM\s*(\d+(?:\.\d+)?)(?:\s*[×x]\s*(\d+(?:\.\d+)?))?\s*-?\s*(6[Hh])?", line, re.I)
+        count_match = re.search(r"(?<![A-Z0-9.])(\d+)\s*[×x]\s*(?:(?:Ø|\u2205)?\s*\d|M)", line, re.I)
+        previous_count = re.search(r"(?<![A-Z0-9.])(\d+)\s*[×x]\s*(?:(?:Ø|\u2205)?\s*\d|M)", previous, re.I)
+        if thread and (count_match or previous_count):
+            count = int((count_match or previous_count).group(1))
+            groups.append({"specification": f"M{thread.group(1)}" + (f"×{thread.group(2)}" if thread.group(2) else "") + ("-6H" if thread.group(3) else ""),
+                           "nominal_diameter": float(thread.group(1)), "count": count,
+                           "source": "PDF视图直接标注", "confidence": "中", "label": "视图引线"})
+        previous = line
+    return groups
+
+
+def analyze_drawing(text: str) -> dict:
+    result = _analyze_before_coordinate_table(text)
+    coordinate_rows = _coordinate_hole_table(text)
+    if not coordinate_rows:
+        return result
+
+    thread_buckets: dict[str, dict] = {}
+    hole_buckets: dict[tuple[float, bool], dict] = {}
+    for row in coordinate_rows:
+        if row.get("thread_spec"):
+            key = row["thread_spec"]
+            bucket = thread_buckets.setdefault(key, {"specification": key, "nominal_diameter": row["thread_diameter"],
+                                                     "count": 0, "labels": [], "source": "PDF坐标孔表", "confidence": "高"})
+            bucket["count"] += 1; bucket["labels"].append(row["label"])
+        if row.get("base_diameter"):
+            key = (round(float(row["base_diameter"]), 3), False)
+            bucket = hole_buckets.setdefault(key, {"diameter": key[0], "count": 0, "depth": None, "through": False,
+                                                    "countersink": False, "counterbore": False, "reamed": False,
+                                                    "source": "PDF坐标孔表", "confidence": "高", "labels": []})
+            bucket["count"] += 1; bucket["labels"].append(row["label"])
+        if row.get("countersink_diameter"):
+            key = (round(float(row["countersink_diameter"]), 3), True)
+            bucket = hole_buckets.setdefault(key, {"diameter": key[0], "count": 0, "depth": None, "through": False,
+                                                    "countersink": True, "counterbore": False, "reamed": False,
+                                                    "source": "PDF坐标孔表", "confidence": "高", "labels": []})
+            bucket["count"] += 1; bucket["labels"].append(row["label"])
+    # First-page numeric call-outs represent additional directions/features;
+    # they are deliberately added once, while A/B labels are never re-counted.
+    for group in _explicit_view_thread_groups(text):
+        key = group["specification"]
+        existed = key in thread_buckets
+        bucket = thread_buckets.setdefault(key, {**group, "labels": []})
+        if existed:
+            bucket["count"] += group["count"]
+            bucket["source"] = "PDF坐标孔表＋视图直接标注"
+            bucket["confidence"] = "高"
+
+    threads = list(thread_buckets.values())
+    holes = list(hole_buckets.values())
+    result.update({
+        "coordinate_hole_details": coordinate_rows,
+        "hole_table_rows": coordinate_rows,
+        "thread_features": threads,
+        "hole_features": holes,
+        "threaded_count": sum(item["count"] for item in threads),
+        "drilled_count": sum(item["count"] for item in holes),
+        "thread_diameters": [item["nominal_diameter"] for item in threads],
+        "thread_groups": [{"规格": item["specification"], "数量": item["count"], "直径": item["nominal_diameter"],
+                           "标签": "、".join(item.get("labels", [])[:12]), "数量来源": item["source"],
+                           "置信度": item["confidence"]} for item in threads],
+        "two_sided_required": bool(re.search(r"两面加工|两侧加工|侧面加工|对面加工", normalize_engineering_text(text))),
+    })
     return result

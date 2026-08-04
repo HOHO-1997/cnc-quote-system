@@ -151,6 +151,19 @@ def calculate_quote(data: dict, rows: list[dict], config: dict, additional: list
     repeated_per_unit = recurring_per_unit + repeated_processing_batch / quantity
     tapping_labor_batch = sum(s["人工金额(元)"] for s in schedules if s.get("执行方式") == "人工攻牙")
     tapping_labor_hours = sum(s["整批人工时间(h)"] for s in schedules if s.get("执行方式") == "人工攻牙")
+    # Amount integrity is deliberately checked at the same level as the
+    # schedule.  A later UI/export must never silently hide a lost operation
+    # or accidentally add one-time preparation twice.
+    schedule_amount = sum(s["整批金额(元)"] for s in schedules)
+    schedule_components = equipment_batch + labor_batch + manual_total_batch
+    recomposed_batch_cost = recurring_per_unit * quantity + discounted_processing_batch + one_time_operation_cost + batch_extra
+    amount_validation = {
+        "schedule_amount": schedule_amount,
+        "schedule_components": schedule_components,
+        "recomposed_batch_cost": recomposed_batch_cost,
+        "reported_batch_cost": batch_cost,
+        "valid": abs(schedule_amount - schedule_components) < 0.01 and abs(recomposed_batch_cost - batch_cost) < 0.01,
+    }
     result = {"unit_cost": unit_cost, "unit_price": unit_price, "batch_cost": batch_cost, "batch_price": batch_price, "one_time_cost": batch_extra + one_time_operation_cost,
             "additional_one_time_cost": batch_extra, "operation_one_time_cost": one_time_operation_cost,
             "repeated_per_unit_cost": repeated_per_unit, "one_time_per_unit": (batch_extra + one_time_operation_cost) / quantity,
@@ -167,7 +180,7 @@ def calculate_quote(data: dict, rows: list[dict], config: dict, additional: list
             "batch_equipment_time": sum(s["整批设备时间(h)"] for s in schedules), "pair_warning": pair_warning,
             "surface_details": surface_details, "additional_details": additional_details, "confirmed_rows": confirmed_rows, "quote_mode": mode,
             "input_operation_count": len(rows), "enabled_operation_count": len(confirmed_rows), "final_billed_operation_count": len(schedules),
-            "batch_efficiency": 1.0}
+            "batch_efficiency": 1.0, "amount_validation": amount_validation}
     if include_tiers:
         sample_quantity = max(1, int(_number(data.get("sample_quantity", 1), 1)))
         sample_data = {**data, "quantity": sample_quantity}
