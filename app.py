@@ -23,8 +23,9 @@ def init_state() -> None:
     st.session_state.setdefault("tier_rows", [{"数量": 1}, {"数量": 5}, {"数量": 10}, {"数量": 50}, {"数量": 100}])
 
 
-def _surface_rows(config: dict) -> list[dict]:
-    return [{"启用": False, "名称": name, "计价方式": item.get("basis", "按kg"), "单价": item.get("rate", 0.0), "最低收费": item.get("minimum", 0.0),
+def _surface_rows(config: dict, drawing: dict | None = None) -> list[dict]:
+    detected = set((drawing or {}).get("surface_processes", []))
+    return [{"启用": name in detected, "名称": name, "计价方式": item.get("basis", "按kg"), "单价": item.get("rate", 0.0), "最低收费": item.get("minimum", 0.0),
              "遮蔽加工面费用": 0.0, "挂具费用": 0.0, "小批量数量": 0, "小批量附加费": 0.0, "手动报价": 0.0} for name, item in config["surface_treatments"].items()]
 
 
@@ -226,7 +227,7 @@ def pricing_page(config: dict) -> None:
         packaging_mode = st.radio("包装费", ["单件费用", "整批费用"], horizontal=True)
         packaging_cost = st.number_input("包装金额（元）", min_value=0.0, value=0.0, step=1.0)
         st.subheader("多选表面处理")
-        surfaces = st.data_editor(pd.DataFrame(_surface_rows(config)), use_container_width=True, hide_index=True, key="surface_editor")
+        surfaces = st.data_editor(pd.DataFrame(_surface_rows(config, drawing)), use_container_width=True, hide_index=True, key="surface_editor")
         st.subheader("其他成本项目")
         additional = st.data_editor(pd.DataFrame(_additional_rows(drawing)), use_container_width=True, hide_index=True, key="additional_editor")
         st.subheader("阶梯批量报价")

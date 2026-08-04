@@ -31,6 +31,8 @@ DEFAULT_CONFIG = {
         "喷漆": {"rate": 2.0, "basis": "按kg", "minimum": 0.0},
         "喷粉": {"rate": 3.0, "basis": "按kg", "minimum": 0.0},
         "黑漆": {"rate": 0.5, "basis": "按kg", "minimum": 0.0},
+        "镀黑锌": {"rate": 8.0, "basis": "按kg", "minimum": 0.0},
+        "烤漆": {"rate": 2.0, "basis": "按kg", "minimum": 0.0},
         "氧化": {"rate": 7.0, "basis": "按kg", "minimum": 0.0},
         "电泳": {"rate": 10.0, "basis": "按kg", "minimum": 0.0},
         "磷化": {"rate": 4.0, "basis": "按kg", "minimum": 0.0},

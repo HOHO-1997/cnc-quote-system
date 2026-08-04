@@ -625,6 +625,18 @@ def _explicit_view_thread_groups(text: str) -> list[dict]:
 
 def analyze_drawing(text: str) -> dict:
     result = _analyze_before_coordinate_table(text)
+    engineering = normalize_engineering_text(text)
+    # Canonical surface-treatment names are kept separate from drawing wording,
+    # so "black zinc plating" / "black zinc" and paint wording can preselect
+    # the correct multiple-choice pricing items without hard-coding a drawing.
+    treatment_signals = {
+        "喷砂": ["喷砂", "喷丸"], "喷漆": ["喷漆"], "烤漆": ["烤漆", "烘烤漆"],
+        "喷粉": ["喷粉"], "黑漆": ["黑漆"], "镀黑锌": ["镀黑锌", "黑锌", "黑色镀锌"],
+        "氧化": ["氧化", "阳极氧化"], "电泳": ["电泳"], "磷化": ["磷化"],
+    }
+    result["surface_processes"] = sorted(set(result.get("surface_processes", [])) | {
+        name for name, words in treatment_signals.items() if any(word in engineering for word in words)
+    })
     coordinate_rows = _coordinate_hole_table(text)
     if not coordinate_rows:
         return result
